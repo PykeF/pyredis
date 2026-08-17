@@ -155,3 +155,52 @@ def test_main_reports_invalid_configuration_without_starting(
 
     assert main() == EXIT_CONFIG_ERROR
     assert "invalid configuration" in capsys.readouterr().err
+
+
+# --------------------------------------------------------------------------
+# Active expiration
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_the_server_reclaims_expired_keys_without_anyone_reading_them() -> None:
+    # Observed through the sweeper's own log line, since any command that
+    # could see the key would also expire it lazily and prove nothing.
+    stream = io.StringIO()
+    configure_logging("DEBUG", stream=stream)
+    server = Server(Config(host="127.0.0.1", port=0))
+    task = asyncio.ensure_future(server.serve())
+    await asyncio.wait_for(server.ready.wait(), timeout=5)
+    try:
+        reader, writer = await asyncio.open_connection("127.0.0.1", server.port)
+        writer.write(b"*5\r\n$3\r\nSET\r\n$1\r\nk\r\n$1\r\nv\r\n$2\r\nPX\r\n$2\r\n10\r\n")
+        await writer.drain()
+        assert await asyncio.wait_for(reader.readuntil(b"\r\n"), timeout=5) == b"+OK\r\n"
+        writer.close()
+        await writer.wait_closed()
+
+        await asyncio.sleep(0.4)  # several 100 ms sweep cycles
+    finally:
+        task.cancel()
+        with suppress(asyncio.CancelledError):
+            await task
+
+    assert "actively expired 1 key(s)" in stream.getvalue()
+
+
+@pytest.mark.asyncio
+async def test_the_expiration_task_does_not_outlive_the_server() -> None:
+    server = Server(Config(host="127.0.0.1", port=0))
+    task = asyncio.ensure_future(server.serve())
+    await asyncio.wait_for(server.ready.wait(), timeout=5)
+
+    task.cancel()
+    with suppress(asyncio.CancelledError):
+        await task
+
+    sweepers = [
+        pending
+        for pending in asyncio.all_tasks()
+        if getattr(pending.get_coro(), "__qualname__", "") == "Server._expire_cycle"
+    ]
+    assert sweepers == []

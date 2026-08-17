@@ -6,9 +6,11 @@ from pyredis.store import (
     INT64_MAX,
     INT64_MIN,
     IntegerOverflowError,
+    InvalidExpireError,
     KeyValueStore,
     NotAnIntegerError,
     StoreError,
+    TtlResult,
 )
 
 #: Deliberately not valid UTF-8, and full of bytes a text-based store would mangle.
@@ -375,3 +377,431 @@ def test_separate_stores_share_no_state() -> None:
 
     assert second.get(b"key") is None
     assert second.dbsize() == 0
+
+
+# --------------------------------------------------------------------------
+# Expiration
+# --------------------------------------------------------------------------
+
+
+class FakeClock:
+    """A clock the tests move by hand, so no test ever waits in real time."""
+
+    def __init__(self, now: int = 1_700_000_000_000) -> None:
+        self.now = now
+
+    def __call__(self) -> int:
+        return self.now
+
+    def advance(self, ms: int) -> None:
+        self.now += ms
+
+
+@pytest.fixture
+def clock() -> FakeClock:
+    return FakeClock()
+
+
+@pytest.fixture
+def timed(clock: FakeClock) -> KeyValueStore:
+    return KeyValueStore(clock=clock)
+
+
+def test_a_key_with_a_ttl_is_readable_before_its_deadline(
+    timed: KeyValueStore, clock: FakeClock
+) -> None:
+    timed.set(b"key", b"value", ttl_ms=1000)
+    clock.advance(999)
+
+    assert timed.get(b"key") == b"value"
+    assert timed.exists(b"key") == 1
+
+
+def test_a_key_expires_exactly_at_its_deadline(
+    timed: KeyValueStore, clock: FakeClock
+) -> None:
+    # The boundary is inclusive: now == deadline means gone.
+    timed.set(b"key", b"value", ttl_ms=1000)
+    clock.advance(1000)
+
+    assert timed.get(b"key") is None
+    assert timed.exists(b"key") == 0
+    assert timed.ttl(b"key") == (False, None)
+
+
+def test_a_long_expired_key_is_missing(timed: KeyValueStore, clock: FakeClock) -> None:
+    timed.set(b"key", b"value", ttl_ms=1000)
+    clock.advance(10_000_000)
+
+    assert timed.get(b"key") is None
+    assert timed.dbsize() == 0
+
+
+def test_reading_an_expired_key_reclaims_it(
+    timed: KeyValueStore, clock: FakeClock
+) -> None:
+    timed.set(b"key", b"value", ttl_ms=1000)
+    clock.advance(1000)
+    timed.get(b"key")
+
+    assert timed.dbsize() == 0
+    assert b"key" not in timed._expires
+
+
+def test_binary_keys_can_carry_a_ttl(timed: KeyValueStore, clock: FakeClock) -> None:
+    timed.set(BINARY_KEY, BINARY_VALUE, ttl_ms=1000)
+
+    assert timed.get(BINARY_KEY) == BINARY_VALUE
+    clock.advance(1000)
+    assert timed.get(BINARY_KEY) is None
+
+
+@pytest.mark.parametrize("ttl_ms", [0, -1, -1000])
+def test_set_rejects_a_non_positive_ttl(timed: KeyValueStore, ttl_ms: int) -> None:
+    with pytest.raises(InvalidExpireError):
+        timed.set(b"key", b"value", ttl_ms=ttl_ms)
+
+
+def test_set_rejects_a_deadline_beyond_the_signed_64_bit_range(
+    timed: KeyValueStore,
+) -> None:
+    with pytest.raises(InvalidExpireError):
+        timed.set(b"key", b"value", ttl_ms=INT64_MAX)
+
+
+def test_a_rejected_ttl_leaves_the_key_untouched(timed: KeyValueStore) -> None:
+    timed.set(b"key", b"original")
+
+    with pytest.raises(InvalidExpireError):
+        timed.set(b"key", b"replacement", ttl_ms=0)
+
+    assert timed.get(b"key") == b"original"
+
+
+# --------------------------------------------------------------------------
+# EXPIRE / TTL / PERSIST
+# --------------------------------------------------------------------------
+
+
+def test_expire_sets_a_deadline_on_an_existing_key(
+    timed: KeyValueStore, clock: FakeClock
+) -> None:
+    timed.set(b"key", b"value")
+
+    assert timed.expire(b"key", 1000) is True
+    clock.advance(999)
+    assert timed.get(b"key") == b"value"
+    clock.advance(1)
+    assert timed.get(b"key") is None
+
+
+def test_expire_reports_false_for_a_missing_key(timed: KeyValueStore) -> None:
+    assert timed.expire(b"missing", 1000) is False
+
+
+def test_expire_reports_false_for_an_already_expired_key(
+    timed: KeyValueStore, clock: FakeClock
+) -> None:
+    timed.set(b"key", b"value", ttl_ms=1000)
+    clock.advance(1000)
+
+    assert timed.expire(b"key", 5000) is False
+    assert timed.get(b"key") is None
+
+
+def test_expire_replaces_an_existing_deadline(
+    timed: KeyValueStore, clock: FakeClock
+) -> None:
+    timed.set(b"key", b"value", ttl_ms=1000)
+
+    timed.expire(b"key", 5000)
+    clock.advance(2000)
+
+    assert timed.get(b"key") == b"value"
+
+
+@pytest.mark.parametrize("ttl_ms", [0, -1, -5000])
+def test_expire_with_a_non_positive_ttl_deletes_the_key(
+    timed: KeyValueStore, ttl_ms: int
+) -> None:
+    timed.set(b"key", b"value")
+
+    assert timed.expire(b"key", ttl_ms) is True
+    assert timed.get(b"key") is None
+    assert timed.dbsize() == 0
+
+
+def test_expire_rejects_a_deadline_beyond_the_signed_64_bit_range(
+    timed: KeyValueStore,
+) -> None:
+    timed.set(b"key", b"value")
+
+    with pytest.raises(InvalidExpireError):
+        timed.expire(b"key", INT64_MAX)
+
+
+def test_ttl_reports_a_missing_key(timed: KeyValueStore) -> None:
+    assert timed.ttl(b"missing") == TtlResult(exists=False, remaining_ms=None)
+
+
+def test_ttl_reports_a_key_without_a_deadline(timed: KeyValueStore) -> None:
+    timed.set(b"key", b"value")
+
+    assert timed.ttl(b"key") == TtlResult(exists=True, remaining_ms=None)
+
+
+def test_ttl_reports_the_remaining_milliseconds(
+    timed: KeyValueStore, clock: FakeClock
+) -> None:
+    timed.set(b"key", b"value", ttl_ms=1000)
+    clock.advance(400)
+
+    assert timed.ttl(b"key") == TtlResult(exists=True, remaining_ms=600)
+
+
+def test_ttl_reports_a_key_gone_at_the_exact_boundary(
+    timed: KeyValueStore, clock: FakeClock
+) -> None:
+    timed.set(b"key", b"value", ttl_ms=1000)
+    clock.advance(1000)
+
+    assert timed.ttl(b"key") == TtlResult(exists=False, remaining_ms=None)
+
+
+def test_persist_removes_a_deadline_and_keeps_the_key(
+    timed: KeyValueStore, clock: FakeClock
+) -> None:
+    timed.set(b"key", b"value", ttl_ms=1000)
+
+    assert timed.persist(b"key") is True
+    clock.advance(10_000)
+    assert timed.get(b"key") == b"value"
+    assert timed.ttl(b"key") == TtlResult(exists=True, remaining_ms=None)
+
+
+def test_persist_reports_false_without_a_deadline(timed: KeyValueStore) -> None:
+    timed.set(b"key", b"value")
+
+    assert timed.persist(b"key") is False
+
+
+def test_persist_reports_false_for_a_missing_key(timed: KeyValueStore) -> None:
+    assert timed.persist(b"missing") is False
+
+
+def test_persist_reports_false_for_an_expired_key(
+    timed: KeyValueStore, clock: FakeClock
+) -> None:
+    timed.set(b"key", b"value", ttl_ms=1000)
+    clock.advance(1000)
+
+    assert timed.persist(b"key") is False
+
+
+# --------------------------------------------------------------------------
+# Interaction between expiration and the P1 operations
+# --------------------------------------------------------------------------
+
+
+def test_plain_set_clears_an_existing_ttl(
+    timed: KeyValueStore, clock: FakeClock
+) -> None:
+    timed.set(b"key", b"value", ttl_ms=1000)
+
+    timed.set(b"key", b"replacement")
+
+    clock.advance(10_000)
+    assert timed.get(b"key") == b"replacement"
+
+
+def test_set_with_a_ttl_replaces_an_existing_ttl(
+    timed: KeyValueStore, clock: FakeClock
+) -> None:
+    timed.set(b"key", b"value", ttl_ms=10_000)
+
+    timed.set(b"key", b"value", ttl_ms=1000)
+
+    clock.advance(1000)
+    assert timed.get(b"key") is None
+
+
+def test_incr_preserves_an_existing_ttl(
+    timed: KeyValueStore, clock: FakeClock
+) -> None:
+    timed.set(b"counter", b"1", ttl_ms=1000)
+
+    assert timed.incr(b"counter") == 2
+
+    assert timed.ttl(b"counter") == TtlResult(exists=True, remaining_ms=1000)
+    clock.advance(1000)
+    assert timed.get(b"counter") is None
+
+
+def test_incr_on_an_expired_key_starts_from_zero(
+    timed: KeyValueStore, clock: FakeClock
+) -> None:
+    timed.set(b"counter", b"41", ttl_ms=1000)
+    clock.advance(1000)
+
+    assert timed.incr(b"counter") == 1
+    assert timed.ttl(b"counter") == TtlResult(exists=True, remaining_ms=None)
+
+
+def test_a_failed_incr_changes_neither_value_nor_ttl(timed: KeyValueStore) -> None:
+    timed.set(b"key", b"abc", ttl_ms=1000)
+
+    with pytest.raises(NotAnIntegerError):
+        timed.incr(b"key")
+
+    assert timed.get(b"key") == b"abc"
+    assert timed.ttl(b"key") == TtlResult(exists=True, remaining_ms=1000)
+
+
+def test_delete_removes_the_expiration_metadata(timed: KeyValueStore) -> None:
+    timed.set(b"key", b"value", ttl_ms=1000)
+
+    assert timed.delete(b"key") == 1
+    assert timed._expires == {}
+
+
+def test_delete_reports_zero_for_an_expired_key(
+    timed: KeyValueStore, clock: FakeClock
+) -> None:
+    timed.set(b"key", b"value", ttl_ms=1000)
+    clock.advance(1000)
+
+    assert timed.delete(b"key") == 0
+
+
+def test_flushdb_removes_all_expiration_metadata(timed: KeyValueStore) -> None:
+    timed.set(b"a", b"1", ttl_ms=1000)
+    timed.set(b"b", b"2", ttl_ms=1000)
+
+    timed.flushdb()
+
+    assert timed._expires == {}
+    assert timed.dbsize() == 0
+
+
+def test_dbsize_counts_only_live_keys(timed: KeyValueStore, clock: FakeClock) -> None:
+    timed.set(b"permanent", b"1")
+    timed.set(b"short", b"2", ttl_ms=1000)
+
+    assert timed.dbsize() == 2
+    clock.advance(1000)
+    assert timed.dbsize() == 1
+
+
+def test_dbsize_reclaims_the_keys_it_skips(
+    timed: KeyValueStore, clock: FakeClock
+) -> None:
+    timed.set(b"short", b"2", ttl_ms=1000)
+    clock.advance(1000)
+
+    timed.dbsize()
+
+    assert timed._data == {}
+    assert timed._expires == {}
+
+
+def test_an_expiration_entry_never_outlives_its_key(
+    timed: KeyValueStore, clock: FakeClock
+) -> None:
+    timed.set(b"a", b"1", ttl_ms=1000)
+    timed.set(b"b", b"2", ttl_ms=5000)
+    timed.set(b"c", b"3")
+
+    timed.delete(b"b")
+    clock.advance(1000)
+    timed.get(b"a")
+
+    assert set(timed._expires) <= set(timed._data)
+    assert timed._expires == {}
+
+
+# --------------------------------------------------------------------------
+# Active expiration
+# --------------------------------------------------------------------------
+
+
+def test_sweep_collects_expired_keys_that_nobody_read(
+    timed: KeyValueStore, clock: FakeClock
+) -> None:
+    for index in range(5):
+        timed.set(b"key%d" % index, b"value", ttl_ms=1000)
+    clock.advance(1000)
+
+    assert timed.sweep_expired(100) == 5
+    assert timed._data == {}
+    assert timed._expires == {}
+
+
+def test_sweep_leaves_live_keys_alone(timed: KeyValueStore, clock: FakeClock) -> None:
+    timed.set(b"live", b"value", ttl_ms=10_000)
+    timed.set(b"dead", b"value", ttl_ms=1000)
+    clock.advance(1000)
+
+    assert timed.sweep_expired(100) == 1
+    assert timed.get(b"live") == b"value"
+
+
+def test_sweep_examines_at_most_the_requested_number_of_keys(
+    timed: KeyValueStore, clock: FakeClock
+) -> None:
+    for index in range(10):
+        timed.set(b"key%d" % index, b"value", ttl_ms=1000)
+    clock.advance(1000)
+
+    assert timed.sweep_expired(4) == 4
+    assert len(timed._expires) == 6
+
+
+def test_repeated_sweeps_eventually_cover_every_key(
+    timed: KeyValueStore, clock: FakeClock
+) -> None:
+    for index in range(10):
+        timed.set(b"key%d" % index, b"value", ttl_ms=1000)
+    clock.advance(1000)
+
+    while timed._expires:
+        timed.sweep_expired(3)
+
+    assert timed._data == {}
+
+
+def test_the_sweep_cursor_reaches_keys_behind_a_long_lived_one(
+    timed: KeyValueStore, clock: FakeClock
+) -> None:
+    # A key inserted first with a distant deadline must not shield the rest
+    # from ever being examined.
+    timed.set(b"immortal", b"value", ttl_ms=10_000_000)
+    for index in range(50):
+        timed.set(b"key%d" % index, b"value", ttl_ms=1000)
+    clock.advance(1000)
+
+    for _ in range(20):
+        timed.sweep_expired(5)
+
+    assert timed.dbsize() == 1
+    assert timed.get(b"immortal") == b"value"
+
+
+def test_sweeping_an_idle_store_does_nothing(timed: KeyValueStore) -> None:
+    assert timed.sweep_expired(100) == 0
+
+    timed.set(b"permanent", b"value")
+
+    assert timed.sweep_expired(100) == 0
+    assert timed.get(b"permanent") == b"value"
+
+
+def test_sweep_does_not_rescan_within_one_call(
+    timed: KeyValueStore, clock: FakeClock
+) -> None:
+    # Two live keys and a limit of 10: the cursor refills once, finds nothing
+    # to remove, and stops rather than spinning over the same keys.
+    timed.set(b"a", b"1", ttl_ms=10_000)
+    timed.set(b"b", b"2", ttl_ms=10_000)
+
+    assert timed.sweep_expired(10) == 0
+    assert timed.dbsize() == 2

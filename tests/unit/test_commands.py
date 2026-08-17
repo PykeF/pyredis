@@ -116,7 +116,15 @@ def test_binary_keys_and_values_pass_through_unchanged(store: KeyValueStore) -> 
     [
         pytest.param([b"PING", b"a", b"b"], "ping", id="ping-too-many"),
         pytest.param([b"SET", b"key"], "set", id="set-too-few"),
-        pytest.param([b"SET", b"key", b"value", b"EX", b"5"], "set", id="set-with-options"),
+        pytest.param(
+            [b"SET", b"key", b"value", b"EX", b"5", b"PX", b"9"], "set", id="set-too-many"
+        ),
+        pytest.param([b"EXPIRE", b"key"], "expire", id="expire-too-few"),
+        pytest.param([b"EXPIRE", b"key", b"1", b"NX"], "expire", id="expire-too-many"),
+        pytest.param([b"TTL"], "ttl", id="ttl-too-few"),
+        pytest.param([b"TTL", b"a", b"b"], "ttl", id="ttl-too-many"),
+        pytest.param([b"PERSIST"], "persist", id="persist-too-few"),
+        pytest.param([b"PERSIST", b"a", b"b"], "persist", id="persist-too-many"),
         pytest.param([b"GET"], "get", id="get-too-few"),
         pytest.param([b"GET", b"a", b"b"], "get", id="get-too-many"),
         pytest.param([b"DEL"], "del", id="del-too-few"),
@@ -188,3 +196,252 @@ def test_every_reply_is_a_single_resp_frame(store: KeyValueStore) -> None:
     # Guards against any reply path forgetting or duplicating a terminator.
     for request_ in ([b"PING"], [b"SET", b"a", b"b"], [b"GET", b"a"], [b"DBSIZE"], [b"NOPE"]):
         assert dispatch(store, request_).endswith(b"\r\n")
+
+
+# --------------------------------------------------------------------------
+# Expiration commands
+# --------------------------------------------------------------------------
+
+
+class FakeClock:
+    """A clock the tests move by hand, so no test ever waits in real time."""
+
+    def __init__(self, now: int = 1_700_000_000_000) -> None:
+        self.now = now
+
+    def __call__(self) -> int:
+        return self.now
+
+    def advance(self, ms: int) -> None:
+        self.now += ms
+
+
+@pytest.fixture
+def clock() -> FakeClock:
+    return FakeClock()
+
+
+@pytest.fixture
+def timed(clock: FakeClock) -> KeyValueStore:
+    return KeyValueStore(clock=clock)
+
+
+def test_set_with_ex_installs_a_deadline(timed: KeyValueStore, clock: FakeClock) -> None:
+    assert dispatch(timed, [b"SET", b"key", b"value", b"EX", b"2"]) == b"+OK\r\n"
+
+    clock.advance(1999)
+    assert dispatch(timed, [b"GET", b"key"]) == b"$5\r\nvalue\r\n"
+    clock.advance(1)
+    assert dispatch(timed, [b"GET", b"key"]) == b"$-1\r\n"
+
+
+def test_set_with_px_installs_a_deadline(timed: KeyValueStore, clock: FakeClock) -> None:
+    assert dispatch(timed, [b"SET", b"key", b"value", b"PX", b"150"]) == b"+OK\r\n"
+
+    clock.advance(149)
+    assert dispatch(timed, [b"GET", b"key"]) == b"$5\r\nvalue\r\n"
+    clock.advance(1)
+    assert dispatch(timed, [b"GET", b"key"]) == b"$-1\r\n"
+
+
+@pytest.mark.parametrize("option", [b"EX", b"ex", b"Ex", b"eX"])
+def test_the_expiration_option_is_case_insensitive(
+    timed: KeyValueStore, option: bytes
+) -> None:
+    assert dispatch(timed, [b"SET", b"key", b"value", option, b"5"]) == b"+OK\r\n"
+    assert dispatch(timed, [b"TTL", b"key"]) == b":5\r\n"
+
+
+def test_set_options_do_not_disturb_binary_keys_and_values(timed: KeyValueStore) -> None:
+    key = b"\x00\xff key"
+    value = b"\r\n\x00binary"
+
+    dispatch(timed, [b"SET", key, value, b"PX", b"5000"])
+
+    assert dispatch(timed, [b"GET", key]) == b"$%d\r\n%s\r\n" % (len(value), value)
+
+
+@pytest.mark.parametrize(
+    "request_",
+    [
+        pytest.param([b"SET", b"k", b"v", b"FOO", b"5"], id="unknown-option"),
+        pytest.param([b"SET", b"k", b"v", b"EX"], id="missing-amount"),
+        pytest.param([b"SET", b"k", b"v", b"5"], id="amount-without-keyword"),
+    ],
+)
+def test_bad_set_option_syntax_is_a_syntax_error(
+    timed: KeyValueStore, request_: list[bytes]
+) -> None:
+    assert dispatch(timed, request_) == b"-ERR syntax error\r\n"
+
+
+@pytest.mark.parametrize("amount", [b"abc", b"1.5", b"+1", b"01", b"", b"\xff"])
+def test_a_malformed_duration_is_reported_as_a_bad_integer(
+    timed: KeyValueStore, amount: bytes
+) -> None:
+    reply = dispatch(timed, [b"SET", b"k", b"v", b"EX", amount])
+
+    assert reply == b"-ERR value is not an integer or out of range\r\n"
+
+
+@pytest.mark.parametrize("amount", [b"0", b"-1"])
+def test_set_rejects_a_non_positive_expire_time(
+    timed: KeyValueStore, amount: bytes
+) -> None:
+    reply = dispatch(timed, [b"SET", b"k", b"v", b"EX", amount])
+
+    assert reply == b"-ERR invalid expire time in 'set' command\r\n"
+
+
+def test_set_rejects_an_overflowing_expire_time(timed: KeyValueStore) -> None:
+    reply = dispatch(timed, [b"SET", b"k", b"v", b"EX", b"9223372036854775807"])
+
+    assert reply == b"-ERR invalid expire time in 'set' command\r\n"
+
+
+def test_a_rejected_set_option_leaves_the_keyspace_untouched(
+    timed: KeyValueStore,
+) -> None:
+    dispatch(timed, [b"SET", b"k", b"v", b"EX", b"0"])
+
+    assert dispatch(timed, [b"DBSIZE"]) == b":0\r\n"
+
+
+def test_expire_returns_one_when_applied(timed: KeyValueStore, clock: FakeClock) -> None:
+    dispatch(timed, [b"SET", b"key", b"value"])
+
+    assert dispatch(timed, [b"EXPIRE", b"key", b"1"]) == b":1\r\n"
+
+    clock.advance(1000)
+    assert dispatch(timed, [b"GET", b"key"]) == b"$-1\r\n"
+
+
+def test_expire_returns_zero_for_a_missing_key(timed: KeyValueStore) -> None:
+    assert dispatch(timed, [b"EXPIRE", b"missing", b"1"]) == b":0\r\n"
+
+
+def test_expire_with_a_non_positive_time_deletes_the_key(timed: KeyValueStore) -> None:
+    dispatch(timed, [b"SET", b"key", b"value"])
+
+    assert dispatch(timed, [b"EXPIRE", b"key", b"0"]) == b":1\r\n"
+    assert dispatch(timed, [b"GET", b"key"]) == b"$-1\r\n"
+
+
+def test_expire_rejects_a_malformed_duration(timed: KeyValueStore) -> None:
+    dispatch(timed, [b"SET", b"key", b"value"])
+
+    assert dispatch(timed, [b"EXPIRE", b"key", b"soon"]) == (
+        b"-ERR value is not an integer or out of range\r\n"
+    )
+
+
+def test_expire_rejects_an_overflowing_expire_time(timed: KeyValueStore) -> None:
+    dispatch(timed, [b"SET", b"key", b"value"])
+
+    assert dispatch(timed, [b"EXPIRE", b"key", b"9223372036854775807"]) == (
+        b"-ERR invalid expire time in 'expire' command\r\n"
+    )
+
+
+def test_ttl_reports_minus_two_for_a_missing_key(timed: KeyValueStore) -> None:
+    assert dispatch(timed, [b"TTL", b"missing"]) == b":-2\r\n"
+
+
+def test_ttl_reports_minus_one_without_a_deadline(timed: KeyValueStore) -> None:
+    dispatch(timed, [b"SET", b"key", b"value"])
+
+    assert dispatch(timed, [b"TTL", b"key"]) == b":-1\r\n"
+
+
+def test_ttl_reports_minus_two_at_the_exact_boundary(
+    timed: KeyValueStore, clock: FakeClock
+) -> None:
+    dispatch(timed, [b"SET", b"key", b"value", b"PX", b"1000"])
+    clock.advance(1000)
+
+    assert dispatch(timed, [b"TTL", b"key"]) == b":-2\r\n"
+
+
+@pytest.mark.parametrize(
+    ("remaining_ms", "expected"),
+    [
+        pytest.param(2000, b":2\r\n", id="two-seconds"),
+        pytest.param(1500, b":2\r\n", id="rounds-half-up"),
+        pytest.param(1499, b":1\r\n", id="rounds-down"),
+        pytest.param(500, b":1\r\n", id="half-second-rounds-up"),
+        pytest.param(499, b":0\r\n", id="under-half-a-second"),
+        pytest.param(1, b":0\r\n", id="one-millisecond-left"),
+    ],
+)
+def test_ttl_rounds_to_the_nearest_second(
+    timed: KeyValueStore, remaining_ms: int, expected: bytes
+) -> None:
+    dispatch(timed, [b"SET", b"key", b"value", b"PX", str(remaining_ms).encode()])
+
+    assert dispatch(timed, [b"TTL", b"key"]) == expected
+
+
+def test_ttl_counts_down(timed: KeyValueStore, clock: FakeClock) -> None:
+    dispatch(timed, [b"SET", b"key", b"value", b"EX", b"10"])
+
+    clock.advance(4000)
+
+    assert dispatch(timed, [b"TTL", b"key"]) == b":6\r\n"
+
+
+def test_persist_returns_one_and_clears_the_deadline(
+    timed: KeyValueStore, clock: FakeClock
+) -> None:
+    dispatch(timed, [b"SET", b"key", b"value", b"EX", b"1"])
+
+    assert dispatch(timed, [b"PERSIST", b"key"]) == b":1\r\n"
+    assert dispatch(timed, [b"TTL", b"key"]) == b":-1\r\n"
+
+    clock.advance(10_000)
+    assert dispatch(timed, [b"GET", b"key"]) == b"$5\r\nvalue\r\n"
+
+
+def test_persist_returns_zero_without_a_deadline(timed: KeyValueStore) -> None:
+    dispatch(timed, [b"SET", b"key", b"value"])
+
+    assert dispatch(timed, [b"PERSIST", b"key"]) == b":0\r\n"
+
+
+def test_persist_returns_zero_for_a_missing_key(timed: KeyValueStore) -> None:
+    assert dispatch(timed, [b"PERSIST", b"missing"]) == b":0\r\n"
+
+
+def test_plain_set_clears_a_deadline(timed: KeyValueStore, clock: FakeClock) -> None:
+    dispatch(timed, [b"SET", b"key", b"value", b"EX", b"1"])
+
+    dispatch(timed, [b"SET", b"key", b"fresh"])
+
+    assert dispatch(timed, [b"TTL", b"key"]) == b":-1\r\n"
+    clock.advance(10_000)
+    assert dispatch(timed, [b"GET", b"key"]) == b"$5\r\nfresh\r\n"
+
+
+def test_incr_keeps_a_deadline(timed: KeyValueStore) -> None:
+    dispatch(timed, [b"SET", b"counter", b"1", b"EX", b"10"])
+
+    assert dispatch(timed, [b"INCR", b"counter"]) == b":2\r\n"
+    assert dispatch(timed, [b"TTL", b"counter"]) == b":10\r\n"
+
+
+def test_dbsize_ignores_expired_keys(timed: KeyValueStore, clock: FakeClock) -> None:
+    dispatch(timed, [b"SET", b"permanent", b"1"])
+    dispatch(timed, [b"SET", b"fleeting", b"2", b"PX", b"100"])
+
+    assert dispatch(timed, [b"DBSIZE"]) == b":2\r\n"
+
+    clock.advance(100)
+    assert dispatch(timed, [b"DBSIZE"]) == b":1\r\n"
+
+
+@pytest.mark.parametrize("name", [b"PTTL", b"PEXPIRE", b"EXPIREAT", b"PEXPIREAT", b"GETEX"])
+def test_unsupported_expiration_commands_are_unknown(
+    timed: KeyValueStore, name: bytes
+) -> None:
+    reply = dispatch(timed, [name, b"key", b"1"])
+
+    assert reply.startswith(b"-ERR unknown command '%s'" % name)

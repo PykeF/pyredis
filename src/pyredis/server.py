@@ -22,6 +22,12 @@ EXIT_OK = 0
 EXIT_LISTEN_ERROR = 1
 EXIT_CONFIG_ERROR = 2
 
+#: Active expiration: how often to sweep, and how many keys carrying a deadline
+#: to examine per sweep. Bounded on purpose -- reclaiming untouched expired
+#: keys is eventual, while lazy expiration keeps every read correct meanwhile.
+SWEEP_INTERVAL_SECONDS = 0.1
+SWEEP_LIMIT = 100
+
 _logger = get_logger(__name__)
 
 
@@ -59,6 +65,7 @@ class Server:
             self._handle_client, self._config.host, self._config.port
         )
         self._port = int(tcp.sockets[0].getsockname()[1])
+        sweeper = asyncio.create_task(self._expire_cycle())
         self._ready.set()
         _logger.info("ready to accept connections on %s:%d", self._config.host, self._port)
         try:
@@ -70,12 +77,18 @@ class Server:
             # this just parks the task until it is cancelled.
             await asyncio.get_running_loop().create_future()
         finally:
-            # Stop accepting, then hang up on live clients. Waiting for them
-            # instead would deadlock: their handlers are blocked reading from
-            # peers that have no reason to disconnect. Nothing is lost, since
-            # a command never yields part-way through.
+            # Stop expiring before anything else, so nothing mutates the
+            # keyspace during teardown. Then stop accepting and hang up on live
+            # clients: waiting for them instead would deadlock, since their
+            # handlers are blocked reading from peers that have no reason to
+            # disconnect. Nothing is lost, as a command never yields part-way
+            # through. Awaiting the sweeper last leaves no pending task behind;
+            # it is safe because its only suspension point is a sleep.
+            sweeper.cancel()
             tcp.close()
             self._disconnect_clients()
+            with suppress(asyncio.CancelledError):
+                await sweeper
             self._ready.clear()
             self._port = None
             _logger.info("listener closed")
@@ -102,6 +115,23 @@ class Server:
     def _disconnect_clients(self) -> None:
         for writer in list(self._clients):
             writer.close()
+
+    async def _expire_cycle(self) -> None:
+        """Reclaim expired keys nobody is reading, on the same event loop.
+
+        The sweep itself is synchronous, so it cannot interleave with a command
+        -- it only ever runs while client tasks are suspended between commands.
+        """
+        while True:
+            await asyncio.sleep(SWEEP_INTERVAL_SECONDS)
+            try:
+                removed = self._store.sweep_expired(SWEEP_LIMIT)
+            except Exception:
+                # A sweep failure must not take the server down with it.
+                _logger.exception("active expiration failed")
+                continue
+            if removed:
+                _logger.debug("actively expired %d key(s)", removed)
 
 
 def main() -> int:

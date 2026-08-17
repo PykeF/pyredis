@@ -3,11 +3,11 @@
 An in-memory key-value store written from scratch in Python, built to speak the
 Redis wire protocol.
 
-> **Status: Phase 2 (RESP2 + TCP server).** PyRedis now speaks RESP2 over raw
-> TCP, so real Redis clients such as `redis-cli -p 6380` can drive it — but only
-> for the eight commands listed below. This is **not** general Redis
-> compatibility: there is no RESP3, no TTL, no persistence, and no eviction, and
-> the vast majority of Redis commands are simply unknown.
+> **Status: Phase 3 (TTL / expiration).** PyRedis speaks RESP2 over raw TCP with
+> key expiration, so real Redis clients such as `redis-cli -p 6380` can drive it
+> — but only for the eleven commands listed below. This is **not** general Redis
+> compatibility: there is no RESP3, no persistence, and no eviction, and the
+> vast majority of Redis commands are simply unknown.
 
 ## Why this exists
 
@@ -26,7 +26,7 @@ narrow: no clustering, replication, Sentinel, Pub/Sub, Streams, Lua, or ACLs.
                 |
         command dispatch              commands.py    done
                 |
-        keyspace  ──  expiration      store.py       done / P3
+        keyspace  ──  expiration      store.py       done
                 |
         AOF append + replay                          P4
                 |
@@ -46,7 +46,7 @@ Design constraints carried through every phase:
 | P0    | Foundation: config, logging, entry point | **Implemented** |
 | P1    | Core in-memory key-value store           | **Implemented** |
 | P2    | RESP2 protocol + async TCP server        | **Implemented** |
-| P3    | TTL / expiration                         | Planned        |
+| P3    | TTL / expiration                         | **Implemented** |
 | P4    | AOF persistence and recovery             | Planned        |
 | P5    | Memory limits and eviction               | Planned        |
 
@@ -107,12 +107,15 @@ Supported commands, and exactly what each answers:
 | ------- | ----- |
 | `PING` | `+PONG` |
 | `PING message` | the message, as a bulk string |
-| `SET key value` | `+OK`. **No options** — `EX`/`PX`/`NX`/`XX` are not accepted |
+| `SET key value [EX s \| PX ms]` | `+OK`. Only those two options; no `NX`/`XX`/`KEEPTTL` |
 | `GET key` | the value as a bulk string, or a null bulk string if unset |
 | `DEL key [key ...]` | integer: how many keys were removed |
 | `EXISTS key [key ...]` | integer: how many exist, counting repeats |
 | `INCR key` | integer: the new value |
-| `DBSIZE` | integer: number of keys |
+| `EXPIRE key seconds` | integer: `1` if a deadline was set, `0` if the key is gone |
+| `TTL key` | integer: seconds left, `-1` if no deadline, `-2` if no key |
+| `PERSIST key` | integer: `1` if a deadline was removed, else `0` |
+| `DBSIZE` | integer: number of **live** keys |
 | `FLUSHDB` | `+OK` |
 
 Everything is binary-safe end to end: bulk strings carry arbitrary bytes, so
@@ -131,6 +134,52 @@ Errors are Redis-shaped and never expose Python internals:
 Unknown commands, wrong arity, and store errors leave the connection usable. A
 protocol error desynchronizes the byte stream, so it is answered and then the
 connection is closed.
+
+**P3 — expiration**
+
+Deadlines are **absolute Unix timestamps in integer milliseconds**, held in a
+dictionary separate from the values. Absolute rather than relative so a deadline
+keeps its meaning across a restart — which is what P4 will have to persist — and
+integers so boundary comparisons and TTL arithmetic are exact. The trade-off of
+a wall clock is that a system time jump moves every deadline with it.
+
+A key expires **when the clock reaches its deadline**: at `now == deadline` it is
+already gone, so `GET` returns nil, `EXISTS` returns `0`, and `TTL` returns `-2`.
+`TTL` rounds to the nearest second (`(remaining_ms + 500) // 1000`), so a key set
+with `EX 2` answers `2` immediately afterwards rather than `1`.
+
+Expiration runs two ways, as Redis does:
+
+- **Lazily** — `GET`, `DEL`, `EXISTS`, `INCR`, `EXPIRE`, `TTL`, `PERSIST`, and
+  `DBSIZE` drop an expired key before answering, so no command ever reports a
+  key that should be gone.
+- **Actively** — an asyncio task on the same event loop sweeps every **100 ms**,
+  examining at most **100 keys carrying a deadline** per cycle via a round-robin
+  cursor. Bounded on purpose: it never scans the whole keyspace in one tick, and
+  it reclaims keys nobody reads, which lazy expiration alone would leak forever.
+  Reclamation is therefore eventual, while correctness is immediate. There is no
+  thread — the sweep is synchronous and can only run between commands.
+
+How expiration interacts with the other commands:
+
+| Rule |
+| --- |
+| A plain `SET` on a key with a TTL **clears** the TTL |
+| `SET … EX/PX` replaces any existing TTL |
+| `INCR` **preserves** the TTL; a failed `INCR` changes neither value nor TTL |
+| `DEL` and `FLUSHDB` remove the expiration metadata with the key |
+| `EXPIRE key 0` or a negative time **deletes the key** and answers `1` |
+| `SET k v EX 0` is an **error** — `invalid expire time in 'set' command` |
+
+**`DBSIZE` counts only logically live keys**, cleaning up expired ones as it
+counts. This deliberately differs from Redis, which reports keys it has not yet
+reclaimed and can therefore claim a key exists that every other command says is
+gone. The cost is proportional to the number of keys with deadlines, not to the
+size of the keyspace.
+
+**Not implemented:** `PTTL`, `PEXPIRE`, `EXPIREAT`, `PEXPIREAT`, `GETEX`,
+`SET … KEEPTTL/NX/XX/GET`, and keyspace notifications. They return unknown-command
+or syntax errors rather than pretending to work.
 
 ### Compatibility boundaries
 
@@ -152,10 +201,9 @@ more**. Concretely:
   1,048,576 elements per request and 64 MiB per bulk string. Configurable
   resource limits belong to P5.
 
-**Not implemented yet:** TTL/expiration and `EXPIRE`, AOF persistence and
-recovery, memory limits and eviction, RESP3, replication, clustering, Pub/Sub,
-transactions, authentication, Lua, and every Redis type other than scalar byte
-values.
+**Not implemented yet:** AOF persistence and recovery (P4), memory limits and
+eviction (P5), RESP3, replication, clustering, Pub/Sub, transactions,
+authentication, Lua, and every Redis type other than scalar byte values.
 
 ## Configuration
 
@@ -203,8 +251,14 @@ OK
 "Pyke"
 127.0.0.1:6380> INCR counter
 (integer) 1
+127.0.0.1:6380> SET session token EX 60
+OK
+127.0.0.1:6380> TTL session
+(integer) 60
+127.0.0.1:6380> PERSIST session
+(integer) 1
 127.0.0.1:6380> DBSIZE
-(integer) 2
+(integer) 3
 127.0.0.1:6380> FLUSHDB
 OK
 ```

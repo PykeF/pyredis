@@ -329,3 +329,79 @@ async def test_shutdown_closes_live_connections() -> None:
 
     assert await live.read_eof() == b""
     await live.close()
+
+
+# --------------------------------------------------------------------------
+# Expiration over the wire
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_set_with_px_expires_over_a_live_connection(client: RespClient) -> None:
+    assert await client.command(b"SET", b"temp", b"value", b"PX", b"100") == b"+OK\r\n"
+    assert await client.command(b"GET", b"temp") == b"$5\r\nvalue\r\n"
+
+    await asyncio.sleep(0.2)
+
+    assert await client.command(b"GET", b"temp") == b"$-1\r\n"
+    assert await client.command(b"TTL", b"temp") == b":-2\r\n"
+    # The connection is still perfectly usable afterwards.
+    assert await client.command(b"PING") == b"+PONG\r\n"
+
+
+@pytest.mark.asyncio
+async def test_set_with_ex_reports_a_ttl(client: RespClient) -> None:
+    await client.command(b"SET", b"temp", b"value", b"EX", b"100")
+
+    assert await client.command(b"TTL", b"temp") == b":100\r\n"
+
+
+@pytest.mark.asyncio
+async def test_expire_then_persist(client: RespClient) -> None:
+    await client.command(b"SET", b"temp", b"value")
+
+    assert await client.command(b"TTL", b"temp") == b":-1\r\n"
+    assert await client.command(b"EXPIRE", b"temp", b"100") == b":1\r\n"
+    assert await client.command(b"TTL", b"temp") == b":100\r\n"
+    assert await client.command(b"PERSIST", b"temp") == b":1\r\n"
+    assert await client.command(b"TTL", b"temp") == b":-1\r\n"
+    assert await client.command(b"PERSIST", b"temp") == b":0\r\n"
+
+
+@pytest.mark.asyncio
+async def test_expire_on_a_missing_key(client: RespClient) -> None:
+    assert await client.command(b"EXPIRE", b"nothing", b"10") == b":0\r\n"
+    assert await client.command(b"TTL", b"nothing") == b":-2\r\n"
+
+
+@pytest.mark.asyncio
+async def test_expiration_errors_keep_the_connection_usable(client: RespClient) -> None:
+    assert await client.command(b"SET", b"k", b"v", b"EX", b"0") == (
+        b"-ERR invalid expire time in 'set' command\r\n"
+    )
+    assert await client.command(b"SET", b"k", b"v", b"FOO", b"1") == b"-ERR syntax error\r\n"
+    assert await client.command(b"EXPIRE", b"k", b"soon") == (
+        b"-ERR value is not an integer or out of range\r\n"
+    )
+    assert await client.command(b"PING") == b"+PONG\r\n"
+
+
+@pytest.mark.asyncio
+async def test_unsupported_expiration_commands_are_unknown(client: RespClient) -> None:
+    for name in (b"PTTL", b"PEXPIRE", b"EXPIREAT", b"PEXPIREAT", b"GETEX"):
+        reply = await client.command(name, b"key", b"1")
+        assert reply.startswith(b"-ERR unknown command '%s'" % name)
+
+    assert await client.command(b"PING") == b"+PONG\r\n"
+
+
+@pytest.mark.asyncio
+async def test_a_binary_key_can_be_expired_over_the_wire(client: RespClient) -> None:
+    key = b"\x00\xff key\r\n"
+
+    await client.command(b"SET", key, b"value", b"PX", b"100")
+    assert await client.command(b"GET", key) == b"$5\r\nvalue\r\n"
+
+    await asyncio.sleep(0.2)
+
+    assert await client.command(b"GET", key) == b"$-1\r\n"
