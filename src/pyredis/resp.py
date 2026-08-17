@@ -21,8 +21,9 @@ CRLF: Final = b"\r\n"
 
 #: Caps on what one request may claim, checked before anything is allocated.
 #: These are deliberate PyRedis safety limits, not a claim of resource-limit
-#: compatibility with real Redis, which permits far larger bulk strings.
-#: Making them configurable is a P5 concern.
+#: compatibility with real Redis, which permits far larger bulk strings. They
+#: are fixed rather than configurable: `maxmemory` bounds the keyspace, while
+#: these bound a single request, and nothing so far has needed to tune them.
 MAX_MULTIBULK_LENGTH: Final = 1024 * 1024
 MAX_BULK_LENGTH: Final = 64 * 1024 * 1024
 
@@ -117,10 +118,6 @@ def _parse_length(raw: bytes, message: str) -> int:
 
 def _disconnected() -> ConnectionError:
     return ConnectionResetError("peer disconnected mid-frame")
-
-
-def encode_simple_string(value: bytes) -> bytes:
-    return b"+" + value + CRLF
 
 
 def encode_integer(value: int) -> bytes:

@@ -14,7 +14,6 @@ from pyredis.resp import (
     encode_bulk_string,
     encode_error,
     encode_integer,
-    encode_simple_string,
     printable,
     read_command,
 )
@@ -197,10 +196,6 @@ def test_fixed_replies_are_correctly_encoded() -> None:
     assert OK == b"+OK\r\n"
     assert PONG == b"+PONG\r\n"
     assert NULL_BULK_STRING == b"$-1\r\n"
-
-
-def test_encodes_a_simple_string() -> None:
-    assert encode_simple_string(b"OK") == b"+OK\r\n"
 
 
 @pytest.mark.parametrize(
