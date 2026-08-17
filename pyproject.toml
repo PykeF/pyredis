@@ -1,0 +1,60 @@
+[project]
+name = "pyredis"
+description = "A Redis-compatible in-memory key-value store written from scratch in Python."
+readme = "README.md"
+requires-python = ">=3.12"
+dynamic = ["version"]
+dependencies = []
+
+[project.scripts]
+pyredis = "pyredis.server:main"
+
+[dependency-groups]
+dev = [
+    "mypy>=1.11",
+    "pytest>=8.0",
+    "pytest-asyncio>=0.24",
+    "ruff>=0.6",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.version]
+path = "src/pyredis/__init__.py"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/pyredis"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = ["--strict-markers", "--strict-config"]
+asyncio_mode = "strict"
+asyncio_default_fixture_loop_scope = "function"
+
+[tool.ruff]
+line-length = 100
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = [
+    "E",    # pycodestyle errors
+    "F",    # pyflakes
+    "W",    # pycodestyle warnings
+    "I",    # isort
+    "N",    # pep8-naming
+    "UP",   # pyupgrade
+    "B",    # flake8-bugbear
+    "A",    # flake8-builtins
+    "C4",   # flake8-comprehensions
+    "SIM",  # flake8-simplify
+    "PTH",  # flake8-use-pathlib
+    "RUF",  # ruff-specific
+]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+warn_unreachable = true
+files = ["src", "tests"]
