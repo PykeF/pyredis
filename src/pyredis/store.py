@@ -214,6 +214,14 @@ class KeyValueStore:
         del self._expires[key]
         return True
 
+    def deadline_ms(self, key: bytes) -> int | None:
+        """The absolute deadline stored for `key`, if it has one.
+
+        Deliberately does not evaluate expiry: callers use it immediately
+        after a mutation to learn the deadline that was just installed.
+        """
+        return self._expires.get(key)
+
     def dbsize(self) -> int:
         """Return the number of live keys.
 
@@ -223,9 +231,18 @@ class KeyValueStore:
         proportional to the number of keys carrying a deadline, not to the
         size of the keyspace.
         """
-        for key in list(self._expires):
-            self._drop_if_expired(key)
+        self.drop_expired()
         return len(self._data)
+
+    def drop_expired(self) -> int:
+        """Remove every key whose deadline has passed; return how many."""
+        now = self._clock()
+        removed = 0
+        for key in list(self._expires):
+            if now >= self._expires[key]:
+                self._remove(key)
+                removed += 1
+        return removed
 
     def flushdb(self) -> None:
         """Remove every key and every deadline. Safe on an empty store."""
@@ -259,6 +276,36 @@ class KeyValueStore:
                 self._remove(key)
                 removed += 1
         return removed
+
+    # -- Recovery primitives ------------------------------------------------
+    #
+    # Used only when replaying a persisted log. They are deliberately blind to
+    # expiry: a replayed deadline may already be in the past, and evaluating it
+    # mid-replay would drop a key that a later record still has something to
+    # say about. One `drop_expired` pass after the replay settles that.
+
+    def restore(self, key: bytes, value: bytes, *, deadline_ms: int | None = None) -> None:
+        """Put `key` back exactly as recorded, deadline included."""
+        self._data[key] = value
+        if deadline_ms is None:
+            self._expires.pop(key, None)
+        else:
+            self._expires[key] = deadline_ms
+
+    def set_deadline(self, key: bytes, deadline_ms: int) -> None:
+        """Attach an absolute deadline to an existing key."""
+        if key in self._data:
+            self._expires[key] = deadline_ms
+
+    def clear_deadline(self, key: bytes) -> None:
+        """Drop `key`'s deadline, if it has one, without touching the value."""
+        self._expires.pop(key, None)
+
+    def discard(self, *keys: bytes) -> None:
+        """Remove `keys` unconditionally, reporting nothing."""
+        for key in keys:
+            self._data.pop(key, None)
+            self._expires.pop(key, None)
 
     def _deadline(self, ttl_ms: int) -> int:
         if ttl_ms <= 0:

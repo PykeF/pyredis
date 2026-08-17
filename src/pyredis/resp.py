@@ -14,6 +14,7 @@ supported commands answers with an array, so no array encoder exists.
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Sequence
 from typing import Final
 
 CRLF: Final = b"\r\n"
@@ -128,6 +129,17 @@ def encode_integer(value: int) -> bytes:
 
 def encode_bulk_string(value: bytes) -> bytes:
     return b"$%d\r\n" % len(value) + value + CRLF
+
+
+def encode_array(parts: Sequence[bytes]) -> bytes:
+    """Encode an array of bulk strings.
+
+    No reply uses this -- it exists so the append-only file can record
+    commands in the same length-prefixed, binary-safe framing the wire uses.
+    """
+    encoded = [b"*%d\r\n" % len(parts)]
+    encoded += [encode_bulk_string(part) for part in parts]
+    return b"".join(encoded)
 
 
 def encode_error(message: str) -> bytes:

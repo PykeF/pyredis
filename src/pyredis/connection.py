@@ -12,6 +12,7 @@ import asyncio
 from contextlib import suppress
 
 from pyredis import resp
+from pyredis.aof import NO_JOURNAL, Journal
 from pyredis.commands import dispatch
 from pyredis.log import get_logger
 from pyredis.store import KeyValueStore
@@ -23,6 +24,7 @@ async def handle_connection(
     reader: asyncio.StreamReader,
     writer: asyncio.StreamWriter,
     store: KeyValueStore,
+    journal: Journal = NO_JOURNAL,
 ) -> None:
     """Serve one client until it disconnects or desynchronizes the stream."""
     peer = peer_name(writer)
@@ -45,7 +47,7 @@ async def handle_connection(
             continue
 
         try:
-            reply = dispatch(store, request)
+            reply = dispatch(store, request, journal)
         except Exception:
             # Boundary catch: a bug must not reach the client as a traceback,
             # and it has not desynchronized the stream, so the session goes on.

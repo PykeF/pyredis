@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import pytest
 
+from pyredis.aof import NO_JOURNAL, PersistenceError, scan
 from pyredis.commands import dispatch
 from pyredis.store import KeyValueStore
 
@@ -445,3 +446,268 @@ def test_unsupported_expiration_commands_are_unknown(
     reply = dispatch(timed, [name, b"key", b"1"])
 
     assert reply.startswith(b"-ERR unknown command '%s'" % name)
+
+
+# --------------------------------------------------------------------------
+# What gets journalled
+# --------------------------------------------------------------------------
+
+
+class FakeJournal:
+    """Records what would have been persisted, and can be made to fail.
+
+    `fail` starts the journal in the failed state, as it would be after an
+    earlier write or an everysec fsync failed. `fail_on_append` models the
+    write that *causes* the failure: healthy when the command is admitted,
+    broken by the time the record is handed over.
+    """
+
+    def __init__(self, *, fail: bool = False, fail_on_append: bool = False) -> None:
+        self.records: list[list[bytes]] = []
+        self.failed = fail
+        self._fail_on_append = fail_on_append
+
+    def append(self, record: bytes) -> None:
+        if self.failed or self._fail_on_append:
+            self.failed = True
+            raise PersistenceError("journal has failed")
+        self.records.append(scan(record).records[0].parts)
+
+    def sync(self) -> None:
+        return None
+
+    def close(self) -> None:
+        return None
+
+
+@pytest.fixture
+def journal() -> FakeJournal:
+    return FakeJournal()
+
+
+def test_set_is_journalled(timed: KeyValueStore, journal: FakeJournal) -> None:
+    dispatch(timed, [b"SET", b"k", b"v"], journal)
+
+    assert journal.records == [[b"SET", b"k", b"v"]]
+
+
+def test_set_with_ex_is_journalled_as_an_absolute_deadline(
+    timed: KeyValueStore, clock: FakeClock, journal: FakeJournal
+) -> None:
+    dispatch(timed, [b"SET", b"k", b"v", b"EX", b"60"], journal)
+
+    assert journal.records == [
+        [b"SET", b"k", b"v", b"PXAT", str(clock.now + 60_000).encode()]
+    ]
+
+
+def test_set_with_px_is_journalled_as_an_absolute_deadline(
+    timed: KeyValueStore, clock: FakeClock, journal: FakeJournal
+) -> None:
+    dispatch(timed, [b"SET", b"k", b"v", b"PX", b"1500"], journal)
+
+    assert journal.records == [
+        [b"SET", b"k", b"v", b"PXAT", str(clock.now + 1500).encode()]
+    ]
+
+
+def test_incr_is_journalled_as_the_resulting_value(
+    timed: KeyValueStore, journal: FakeJournal
+) -> None:
+    dispatch(timed, [b"INCR", b"counter"], journal)
+    dispatch(timed, [b"INCR", b"counter"], journal)
+
+    assert journal.records == [
+        [b"SET", b"counter", b"1"],
+        [b"SET", b"counter", b"2"],
+    ]
+
+
+def test_incr_keeps_the_deadline_in_its_record(
+    timed: KeyValueStore, clock: FakeClock, journal: FakeJournal
+) -> None:
+    dispatch(timed, [b"SET", b"counter", b"1", b"EX", b"60"], journal)
+    journal.records.clear()
+
+    dispatch(timed, [b"INCR", b"counter"], journal)
+
+    assert journal.records == [
+        [b"SET", b"counter", b"2", b"PXAT", str(clock.now + 60_000).encode()]
+    ]
+
+
+def test_expire_is_journalled_as_pexpireat(
+    timed: KeyValueStore, clock: FakeClock, journal: FakeJournal
+) -> None:
+    dispatch(timed, [b"SET", b"k", b"v"], journal)
+    journal.records.clear()
+
+    dispatch(timed, [b"EXPIRE", b"k", b"30"], journal)
+
+    assert journal.records == [[b"PEXPIREAT", b"k", str(clock.now + 30_000).encode()]]
+
+
+def test_expire_with_a_non_positive_time_is_journalled_as_a_delete(
+    timed: KeyValueStore, journal: FakeJournal
+) -> None:
+    dispatch(timed, [b"SET", b"k", b"v"], journal)
+    journal.records.clear()
+
+    dispatch(timed, [b"EXPIRE", b"k", b"0"], journal)
+
+    assert journal.records == [[b"DEL", b"k"]]
+
+
+def test_del_and_persist_and_flushdb_are_journalled(
+    timed: KeyValueStore, journal: FakeJournal
+) -> None:
+    dispatch(timed, [b"SET", b"k", b"v", b"EX", b"60"], journal)
+    journal.records.clear()
+
+    dispatch(timed, [b"PERSIST", b"k"], journal)
+    dispatch(timed, [b"DEL", b"k"], journal)
+    dispatch(timed, [b"FLUSHDB"], journal)
+
+    assert journal.records == [[b"PERSIST", b"k"], [b"DEL", b"k"], [b"FLUSHDB"]]
+
+
+@pytest.mark.parametrize(
+    "request_",
+    [
+        pytest.param([b"GET", b"k"], id="get"),
+        pytest.param([b"EXISTS", b"k"], id="exists"),
+        pytest.param([b"TTL", b"k"], id="ttl"),
+        pytest.param([b"DBSIZE"], id="dbsize"),
+        pytest.param([b"PING"], id="ping"),
+    ],
+)
+def test_reads_are_never_journalled(
+    timed: KeyValueStore, journal: FakeJournal, request_: list[bytes]
+) -> None:
+    dispatch(timed, request_, journal)
+
+    assert journal.records == []
+
+
+@pytest.mark.parametrize(
+    "request_",
+    [
+        pytest.param([b"SET", b"k"], id="wrong-arity"),
+        pytest.param([b"SET", b"k", b"v", b"FOO", b"1"], id="syntax-error"),
+        pytest.param([b"SET", b"k", b"v", b"EX", b"0"], id="invalid-expire-time"),
+        pytest.param([b"SET", b"k", b"v", b"EX", b"abc"], id="malformed-duration"),
+        pytest.param([b"DEL", b"missing"], id="delete-of-a-missing-key"),
+        pytest.param([b"PERSIST", b"missing"], id="persist-without-a-deadline"),
+        pytest.param([b"EXPIRE", b"missing", b"5"], id="expire-of-a-missing-key"),
+        pytest.param([b"NOPE", b"k"], id="unknown-command"),
+    ],
+)
+def test_commands_that_change_nothing_are_never_journalled(
+    timed: KeyValueStore, journal: FakeJournal, request_: list[bytes]
+) -> None:
+    dispatch(timed, request_, journal)
+
+    assert journal.records == []
+
+
+def test_a_failed_incr_is_not_journalled(
+    timed: KeyValueStore, journal: FakeJournal
+) -> None:
+    dispatch(timed, [b"SET", b"k", b"abc"], journal)
+    journal.records.clear()
+
+    dispatch(timed, [b"INCR", b"k"], journal)
+
+    assert journal.records == []
+
+
+# --------------------------------------------------------------------------
+# Persistence failure
+# --------------------------------------------------------------------------
+
+
+PERSISTENCE_ERROR = b"-ERR persistence failure\r\n"
+
+
+def test_the_command_that_hits_the_failure_is_told(timed: KeyValueStore) -> None:
+    breaking = FakeJournal(fail_on_append=True)
+
+    assert dispatch(timed, [b"SET", b"k", b"v"], breaking) == PERSISTENCE_ERROR
+
+
+def test_the_mutation_that_failed_may_remain_visible_in_memory(
+    timed: KeyValueStore,
+) -> None:
+    # No rollback is attempted: the write happened, it just is not durable.
+    breaking = FakeJournal(fail_on_append=True)
+
+    dispatch(timed, [b"SET", b"k", b"v"], breaking)
+
+    assert timed.get(b"k") == b"v"
+
+
+def test_the_failing_write_puts_the_journal_into_the_failed_state(
+    timed: KeyValueStore,
+) -> None:
+    breaking = FakeJournal(fail_on_append=True)
+
+    assert dispatch(timed, [b"SET", b"k", b"v"], breaking) == PERSISTENCE_ERROR
+    assert breaking.failed is True
+    # The next mutation is turned away before it can reach the store.
+    assert dispatch(timed, [b"SET", b"other", b"value"], breaking) == PERSISTENCE_ERROR
+    assert timed.get(b"other") is None
+
+
+@pytest.mark.parametrize(
+    "request_",
+    [
+        pytest.param([b"SET", b"other", b"value"], id="set"),
+        pytest.param([b"DEL", b"k"], id="del"),
+        pytest.param([b"INCR", b"counter"], id="incr"),
+        pytest.param([b"EXPIRE", b"k", b"60"], id="expire"),
+        pytest.param([b"PERSIST", b"k"], id="persist"),
+        pytest.param([b"FLUSHDB"], id="flushdb"),
+    ],
+)
+def test_later_mutations_are_refused_before_they_touch_the_store(
+    timed: KeyValueStore, request_: list[bytes]
+) -> None:
+    failing = FakeJournal(fail=True)
+    timed.set(b"k", b"original", ttl_ms=60_000)
+    timed.set(b"counter", b"5")
+    before = dict(timed._data)
+
+    assert dispatch(timed, request_, failing) == PERSISTENCE_ERROR
+    assert timed._data == before, "the store was mutated despite a failed journal"
+
+
+def test_reads_keep_working_after_a_persistence_failure(timed: KeyValueStore) -> None:
+    failing = FakeJournal(fail=True)
+    timed.set(b"k", b"v", ttl_ms=60_000)
+
+    assert dispatch(timed, [b"GET", b"k"], failing) == b"$1\r\nv\r\n"
+    assert dispatch(timed, [b"EXISTS", b"k"], failing) == b":1\r\n"
+    assert dispatch(timed, [b"TTL", b"k"], failing) == b":60\r\n"
+    assert dispatch(timed, [b"DBSIZE"], failing) == b":1\r\n"
+    assert dispatch(timed, [b"PING"], failing) == b"+PONG\r\n"
+
+
+def test_a_journal_that_fails_mid_session_stops_accepting_writes(
+    timed: KeyValueStore, journal: FakeJournal
+) -> None:
+    assert dispatch(timed, [b"SET", b"a", b"1"], journal) == b"+OK\r\n"
+
+    journal.failed = True  # as an everysec fsync failure would leave it
+
+    assert dispatch(timed, [b"SET", b"b", b"2"], journal) == PERSISTENCE_ERROR
+    assert timed.get(b"b") is None
+    assert timed.get(b"a") == b"1"
+
+
+def test_persistence_failures_do_not_exist_when_the_aof_is_disabled(
+    timed: KeyValueStore,
+) -> None:
+    for request_ in ([b"SET", b"k", b"v"], [b"INCR", b"c"], [b"DEL", b"k"], [b"FLUSHDB"]):
+        assert dispatch(timed, request_) != PERSISTENCE_ERROR
+
+    assert NO_JOURNAL.failed is False

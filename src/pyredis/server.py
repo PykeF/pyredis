@@ -11,8 +11,18 @@ from __future__ import annotations
 import asyncio
 import sys
 from contextlib import suppress
+from pathlib import Path
 
 from pyredis import __version__
+from pyredis.aof import (
+    NO_JOURNAL,
+    AofError,
+    AppendOnlyFile,
+    FsyncPolicy,
+    Journal,
+    PersistenceError,
+    load,
+)
 from pyredis.config import Config, ConfigError
 from pyredis.connection import handle_connection, peer_name
 from pyredis.log import configure_logging, get_logger
@@ -21,12 +31,18 @@ from pyredis.store import KeyValueStore
 EXIT_OK = 0
 EXIT_LISTEN_ERROR = 1
 EXIT_CONFIG_ERROR = 2
+EXIT_PERSISTENCE_ERROR = 3
 
 #: Active expiration: how often to sweep, and how many keys carrying a deadline
 #: to examine per sweep. Bounded on purpose -- reclaiming untouched expired
 #: keys is eventual, while lazy expiration keeps every read correct meanwhile.
 SWEEP_INTERVAL_SECONDS = 0.1
 SWEEP_LIMIT = 100
+
+#: How often the `everysec` policy asks the OS to commit the journal. The fsync
+#: runs on the event loop and can stall it; once a second is the price of not
+#: introducing threads or locks for it.
+FSYNC_INTERVAL_SECONDS = 1.0
 
 _logger = get_logger(__name__)
 
@@ -40,6 +56,7 @@ class Server:
         self._ready = asyncio.Event()
         self._port: int | None = None
         self._clients: set[asyncio.StreamWriter] = set()
+        self._journal: Journal = NO_JOURNAL
 
     @property
     def config(self) -> Config:
@@ -61,11 +78,19 @@ class Server:
     async def serve(self) -> None:
         """Accept and serve clients until cancelled."""
         _logger.info("pyredis %s starting", __version__)
+        # Recovery happens before the listener exists, so no client can ever
+        # observe a half-loaded keyspace.
+        self._recover()
         tcp = await asyncio.start_server(
             self._handle_client, self._config.host, self._config.port
         )
         self._port = int(tcp.sockets[0].getsockname()[1])
         sweeper = asyncio.create_task(self._expire_cycle())
+        syncer = (
+            asyncio.create_task(self._fsync_cycle())
+            if self._config.aof_fsync is FsyncPolicy.EVERYSEC
+            else None
+        )
         self._ready.set()
         _logger.info("ready to accept connections on %s:%d", self._config.host, self._port)
         try:
@@ -85,10 +110,18 @@ class Server:
             # through. Awaiting the sweeper last leaves no pending task behind;
             # it is safe because its only suspension point is a sleep.
             sweeper.cancel()
+            if syncer is not None:
+                syncer.cancel()
             tcp.close()
             self._disconnect_clients()
             with suppress(asyncio.CancelledError):
                 await sweeper
+            if syncer is not None:
+                with suppress(asyncio.CancelledError):
+                    await syncer
+            # Last chance to get everything on disk before the file goes.
+            self._journal.close()
+            self._journal = NO_JOURNAL
             self._ready.clear()
             self._port = None
             _logger.info("listener closed")
@@ -104,7 +137,7 @@ class Server:
         _logger.debug("client connected: %s", peer)
         self._clients.add(writer)
         try:
-            await handle_connection(reader, writer, self._store)
+            await handle_connection(reader, writer, self._store, self._journal)
         finally:
             self._clients.discard(writer)
             writer.close()
@@ -115,6 +148,34 @@ class Server:
     def _disconnect_clients(self) -> None:
         for writer in list(self._clients):
             writer.close()
+
+    def _recover(self) -> None:
+        """Replay the append-only file, then open it for writing.
+
+        Any failure here is fatal: starting with a keyspace that silently
+        disagrees with the log on disk would be worse than not starting.
+        """
+        if not self._config.aof_enabled:
+            return
+        path = Path(self._config.aof_path)
+        result = load(path, self._store)
+        _logger.info(
+            "loaded %d record(s) from %s: %d key(s), %d expired while down",
+            result.records,
+            path,
+            result.keys,
+            result.expired,
+        )
+        self._journal = AppendOnlyFile(path, self._config.aof_fsync)
+
+    async def _fsync_cycle(self) -> None:
+        """Commit the journal to disk once a second under the everysec policy."""
+        while True:
+            await asyncio.sleep(FSYNC_INTERVAL_SECONDS)
+            with suppress(PersistenceError):
+                # A failure has already been logged and has marked the journal
+                # failed, which is what stops later writes.
+                self._journal.sync()
 
     async def _expire_cycle(self) -> None:
         """Reclaim expired keys nobody is reading, on the same event loop.
@@ -148,6 +209,9 @@ def main() -> int:
         Server(config).run()
     except KeyboardInterrupt:
         _logger.info("interrupted; shutting down")
+    except AofError as exc:
+        _logger.error("cannot use the append-only file %s: %s", config.aof_path, exc)
+        return EXIT_PERSISTENCE_ERROR
     except OSError as exc:
         _logger.error("cannot listen on %s: %s", config.address, exc)
         return EXIT_LISTEN_ERROR

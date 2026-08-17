@@ -3,11 +3,12 @@
 An in-memory key-value store written from scratch in Python, built to speak the
 Redis wire protocol.
 
-> **Status: Phase 3 (TTL / expiration).** PyRedis speaks RESP2 over raw TCP with
-> key expiration, so real Redis clients such as `redis-cli -p 6380` can drive it
-> — but only for the eleven commands listed below. This is **not** general Redis
-> compatibility: there is no RESP3, no persistence, and no eviction, and the
-> vast majority of Redis commands are simply unknown.
+> **Status: Phase 4 (AOF persistence).** PyRedis speaks RESP2 over raw TCP with
+> key expiration and optional durability, so real Redis clients such as
+> `redis-cli -p 6380` can drive it — but only for the eleven commands listed
+> below. This is **not** general Redis compatibility: there is no RESP3, no
+> eviction, no AOF rewrite, and the vast majority of Redis commands are simply
+> unknown.
 
 ## Why this exists
 
@@ -28,7 +29,7 @@ narrow: no clustering, replication, Sentinel, Pub/Sub, Streams, Lua, or ACLs.
                 |
         keyspace  ──  expiration      store.py       done
                 |
-        AOF append + replay                          P4
+        AOF append + replay           aof.py         done
                 |
         memory accounting + eviction                 P5
 ```
@@ -47,7 +48,7 @@ Design constraints carried through every phase:
 | P1    | Core in-memory key-value store           | **Implemented** |
 | P2    | RESP2 protocol + async TCP server        | **Implemented** |
 | P3    | TTL / expiration                         | **Implemented** |
-| P4    | AOF persistence and recovery             | Planned        |
+| P4    | AOF persistence and recovery             | **Implemented** |
 | P5    | Memory limits and eviction               | Planned        |
 
 ## What is actually implemented
@@ -181,6 +182,84 @@ size of the keyspace.
 `SET … KEEPTTL/NX/XX/GET`, and keyspace notifications. They return unknown-command
 or syntax errors rather than pretending to work.
 
+**P4 — append-only persistence**
+
+Off by default. Enable it with `PYREDIS_AOF_ENABLED=true`, and every mutation is
+appended to a log that is replayed at startup.
+
+Records are RESP2 arrays — the same framing as the wire protocol, so binary keys
+and values need no escaping — but the recorded vocabulary is deliberately a
+**superset** of the client vocabulary. Commands whose meaning depends on *when*
+they ran are rewritten into an absolute form; everything else is recorded as
+issued:
+
+| Command | Recorded as |
+| ------- | ----------- |
+| `SET k v` | `SET k v` |
+| `SET k v EX 60` / `PX 5000` | `SET k v PXAT <absolute ms>` |
+| `EXPIRE k 60` | `PEXPIREAT k <absolute ms>` |
+| `EXPIRE k 0` (deletes) | `DEL k` |
+| `INCR k` | `SET k <resulting value>` [`PXAT …`] |
+| `DEL`, `PERSIST`, `FLUSHDB` | as issued |
+| reads, errors, and no-ops | nothing at all |
+
+`PXAT` and `PEXPIREAT` exist only inside the file; no client can send them.
+Because deadlines are recorded as absolute timestamps, **a key written with
+`EX 60` comes back with whatever is left of that minute, never a fresh one**,
+and a key whose deadline passed during downtime is simply gone on startup.
+
+`INCR` is recorded as the value it produced rather than as an increment, so
+every record is a statement of fact rather than a computation and replay cannot
+fail on the data.
+
+**Recovery** happens before the listener binds, so no client ever sees a
+half-loaded keyspace. Replay uses lower-level store primitives rather than the
+command dispatcher, and **expiration is switched off while it runs** — otherwise
+a stale deadline applied mid-replay would delete a key that a later `PERSIST`
+was about to save. One sweep afterwards drops whatever really did expire.
+
+**Damaged files** are treated differently depending on where the damage is:
+
+| File state | Startup |
+| ---------- | ------- |
+| Intact | Loads |
+| Final record torn by a crash mid-append | **Repaired** — truncated to the last good record, with a warning |
+| Corruption anywhere earlier | **Refuses to start**, naming the byte offset |
+
+The asymmetry is deliberate: a torn tail is the normal result of losing power
+mid-write, while corruption in the middle would mean silently discarding every
+write that followed it.
+
+**Durability** is controlled by `PYREDIS_AOF_FSYNC`. Every append flushes to the
+operating system regardless of policy, so killing the process loses nothing —
+the policy only decides how much a *power* failure can take:
+
+| Policy | Loses at most | Cost |
+| ------ | ------------- | ---- |
+| `always` | one unacknowledged write | an fsync per write; **stalls the event loop** on every write |
+| `everysec` *(default)* | ~1 second of writes | one blocking fsync per second |
+| `no` | whatever the OS hasn't flushed | none |
+
+fsync runs on the event loop, with no thread and no lock — that is what keeps
+every store operation atomic without synchronisation, and it is why `always` is
+slow rather than merely expensive.
+
+**When persistence fails** (a full disk, an I/O error), the journal enters a
+failed state and stays there:
+
+- the command that hit the failure is answered `-ERR persistence failure`; its
+  mutation has already happened in memory and is **not** rolled back
+- every later mutation is refused *before* it touches the store, so nothing new
+  happens in memory that could never reach disk
+- reads (`GET`, `EXISTS`, `TTL`, `DBSIZE`, `PING`) keep working
+- the state never clears itself — **restarting the server is the recovery
+  mechanism**
+
+**Not implemented:** AOF rewrite/compaction, so the log grows without bound and
+an `INCR`-heavy workload makes for a slow reload; RDB snapshots; a format
+version header; per-record checksums; and streaming replay (the file is read
+into memory at startup).
+
 ### Compatibility boundaries
 
 PyRedis targets real RESP2 clients **for the eight commands above, and nothing
@@ -201,9 +280,9 @@ more**. Concretely:
   1,048,576 elements per request and 64 MiB per bulk string. Configurable
   resource limits belong to P5.
 
-**Not implemented yet:** AOF persistence and recovery (P4), memory limits and
-eviction (P5), RESP3, replication, clustering, Pub/Sub, transactions,
-authentication, Lua, and every Redis type other than scalar byte values.
+**Not implemented yet:** memory limits and eviction (P5), RESP3, replication,
+clustering, Pub/Sub, transactions, authentication, Lua, and every Redis type
+other than scalar byte values.
 
 ## Configuration
 
@@ -212,12 +291,16 @@ authentication, Lua, and every Redis type other than scalar byte values.
 | `PYREDIS_HOST`      | `127.0.0.1` | Interface to bind                              |
 | `PYREDIS_PORT`      | `6380`      | TCP port — avoids a local Redis on 6379        |
 | `PYREDIS_LOG_LEVEL` | `INFO`      | `DEBUG`/`INFO`/`WARNING`/`ERROR`/`CRITICAL`    |
+| `PYREDIS_AOF_ENABLED` | `false`   | Append every mutation to a log and replay it at startup |
+| `PYREDIS_AOF_PATH`  | `pyredis.aof` | Where that log lives                       |
+| `PYREDIS_AOF_FSYNC` | `everysec`  | `always` / `everysec` / `no`                   |
 
 Port `0` is accepted and asks the OS for a free port, which the startup log then
 reports. (That is not Redis' meaning for port 0, which is "do not listen".)
 
 Exit codes: `0` on a clean shutdown, `1` if the port cannot be bound, `2` for
-invalid configuration.
+invalid configuration, `3` if the append-only file cannot be read, repaired, or
+opened.
 
 See [.env.example](.env.example). PyRedis reads the process environment and does
 not parse `.env` files itself; load one with `uv run --env-file .env pyredis`.
@@ -261,6 +344,12 @@ OK
 (integer) 3
 127.0.0.1:6380> FLUSHDB
 OK
+```
+
+To keep the data across restarts, turn on the append-only file:
+
+```bash
+PYREDIS_AOF_ENABLED=true uv run pyredis
 ```
 
 The keyspace is also usable directly as a library, with no server involved:
