@@ -23,7 +23,10 @@ DEFAULT_HOST: Final = "127.0.0.1"
 DEFAULT_PORT: Final = 6380
 DEFAULT_LOG_LEVEL: Final = "INFO"
 
-_MIN_PORT: Final = 1
+#: Port 0 is permitted and means "let the OS assign a free port", which is how
+#: throwaway and test instances bind without racing for a fixed number. Note
+#: this is not Redis' meaning for port 0, which is "do not listen on TCP".
+_MIN_PORT: Final = 0
 _MAX_PORT: Final = 65535
 
 

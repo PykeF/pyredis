@@ -67,10 +67,14 @@ def test_non_integer_port_is_rejected() -> None:
         Config.from_env({"PYREDIS_PORT": "not-a-port"})
 
 
-@pytest.mark.parametrize("port", ["0", "-1", "65536"])
+@pytest.mark.parametrize("port", ["-1", "65536", "99999"])
 def test_out_of_range_port_is_rejected(port: str) -> None:
     with pytest.raises(ConfigError, match="PYREDIS_PORT must be between"):
         Config.from_env({"PYREDIS_PORT": port})
+
+
+def test_port_zero_is_allowed_and_means_an_os_assigned_port() -> None:
+    assert Config.from_env({"PYREDIS_PORT": "0"}).port == 0
 
 
 def test_empty_host_is_rejected() -> None:
@@ -85,7 +89,7 @@ def test_unknown_log_level_is_rejected() -> None:
 
 def test_direct_construction_is_validated_too() -> None:
     with pytest.raises(ConfigError):
-        Config(port=0)
+        Config(port=70000)
 
 
 def test_address_joins_host_and_port() -> None:
