@@ -4,7 +4,11 @@ import pytest
 
 from pyredis.aof import NO_JOURNAL, PersistenceError, scan
 from pyredis.commands import dispatch
-from pyredis.store import KeyValueStore
+from pyredis.store import (
+    ENTRY_OVERHEAD_BYTES,
+    KeyValueStore,
+    MaxmemoryPolicy,
+)
 
 
 @pytest.fixture
@@ -711,3 +715,126 @@ def test_persistence_failures_do_not_exist_when_the_aof_is_disabled(
         assert dispatch(timed, request_) != PERSISTENCE_ERROR
 
     assert NO_JOURNAL.failed is False
+
+
+# --------------------------------------------------------------------------
+# Memory limits and eviction
+# --------------------------------------------------------------------------
+
+
+OOM_ERROR = b"-OOM command not allowed when used memory > 'maxmemory'.\r\n"
+
+
+def entry_cost(key: bytes, value: bytes) -> int:
+    return len(key) + len(value) + ENTRY_OVERHEAD_BYTES
+
+
+def test_a_refused_write_answers_with_the_oom_code(clock: FakeClock) -> None:
+    store = KeyValueStore(clock=clock, maxmemory=entry_cost(b"first_", b"value"))
+    dispatch(store, [b"SET", b"first_", b"value"])
+
+    assert dispatch(store, [b"SET", b"second", b"value"]) == OOM_ERROR
+
+
+def test_a_refused_write_changes_nothing_and_journals_nothing(
+    clock: FakeClock, journal: FakeJournal
+) -> None:
+    store = KeyValueStore(clock=clock, maxmemory=entry_cost(b"first_", b"value"))
+    dispatch(store, [b"SET", b"first_", b"value"], journal)
+    journal.records.clear()
+
+    assert dispatch(store, [b"SET", b"second", b"value"], journal) == OOM_ERROR
+    assert journal.records == []
+    assert dispatch(store, [b"DBSIZE"], journal) == b":1\r\n"
+
+
+def test_incr_can_be_refused_for_memory(clock: FakeClock) -> None:
+    store = KeyValueStore(clock=clock, maxmemory=entry_cost(b"count_", b"9"))
+    dispatch(store, [b"SET", b"count_", b"9"])
+
+    assert dispatch(store, [b"INCR", b"count_"]) == OOM_ERROR
+    assert dispatch(store, [b"GET", b"count_"]) == b"$1\r\n9\r\n"
+
+
+def test_expire_is_never_refused_for_memory(clock: FakeClock) -> None:
+    store = KeyValueStore(clock=clock, maxmemory=entry_cost(b"first_", b"value"))
+    dispatch(store, [b"SET", b"first_", b"value"])
+
+    assert dispatch(store, [b"EXPIRE", b"first_", b"60"]) == b":1\r\n"
+    assert dispatch(store, [b"TTL", b"first_"]) == b":60\r\n"
+
+
+def test_reads_still_work_at_the_memory_limit(clock: FakeClock) -> None:
+    store = KeyValueStore(clock=clock, maxmemory=entry_cost(b"first_", b"value"))
+    dispatch(store, [b"SET", b"first_", b"value"])
+
+    assert dispatch(store, [b"GET", b"first_"]) == b"$5\r\nvalue\r\n"
+    assert dispatch(store, [b"EXISTS", b"first_"]) == b":1\r\n"
+    assert dispatch(store, [b"PING"]) == b"+PONG\r\n"
+
+
+def test_an_eviction_is_journalled_as_a_delete_before_the_write(
+    clock: FakeClock, journal: FakeJournal
+) -> None:
+    store = KeyValueStore(
+        clock=clock,
+        maxmemory=2 * entry_cost(b"first_", b"value"),
+        policy=MaxmemoryPolicy.ALLKEYS_LRU,
+    )
+    dispatch(store, [b"SET", b"first_", b"value"], journal)
+    dispatch(store, [b"SET", b"second", b"value"], journal)
+    journal.records.clear()
+
+    dispatch(store, [b"SET", b"third_", b"value"], journal)
+
+    assert journal.records == [
+        [b"DEL", b"first_"],
+        [b"SET", b"third_", b"value"],
+    ]
+
+
+def test_an_incr_that_evicts_journals_the_eviction(
+    clock: FakeClock, journal: FakeJournal
+) -> None:
+    store = KeyValueStore(
+        clock=clock,
+        maxmemory=2 * entry_cost(b"count_", b"9"),
+        policy=MaxmemoryPolicy.ALLKEYS_LRU,
+    )
+    dispatch(store, [b"SET", b"other_", b"9"], journal)
+    dispatch(store, [b"SET", b"count_", b"9"], journal)
+    journal.records.clear()
+
+    dispatch(store, [b"INCR", b"count_"], journal)
+
+    assert journal.records == [
+        [b"DEL", b"other_"],
+        [b"SET", b"count_", b"10"],
+    ]
+
+
+def test_a_persistence_failure_during_eviction_keeps_the_p4_behaviour(
+    clock: FakeClock,
+) -> None:
+    breaking = FakeJournal(fail_on_append=True)
+    store = KeyValueStore(
+        clock=clock,
+        maxmemory=2 * entry_cost(b"first_", b"value"),
+        policy=MaxmemoryPolicy.ALLKEYS_LRU,
+    )
+    store.set(b"first_", b"value")
+    store.set(b"second", b"value")
+
+    # The eviction DEL is the append that fails.
+    assert dispatch(store, [b"SET", b"third_", b"value"], breaking) == (
+        b"-ERR persistence failure\r\n"
+    )
+    assert breaking.failed is True
+    # No rollback, exactly as in P4: the eviction and the write both stand.
+    assert store.get(b"first_") is None
+    assert store.get(b"third_") == b"value"
+    # And nothing further may mutate, while reads carry on.
+    assert dispatch(store, [b"SET", b"fourth", b"value"], breaking) == (
+        b"-ERR persistence failure\r\n"
+    )
+    assert dispatch(store, [b"GET", b"third_"], breaking) == b"$5\r\nvalue\r\n"

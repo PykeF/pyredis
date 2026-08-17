@@ -9,6 +9,7 @@ from pyredis.config import (
     Config,
     ConfigError,
 )
+from pyredis.store import MaxmemoryPolicy
 
 
 def test_defaults_apply_when_environment_is_empty() -> None:
@@ -101,3 +102,70 @@ def test_config_is_immutable() -> None:
 
     with pytest.raises(AttributeError):
         config.port = 1234  # type: ignore[misc]
+
+
+# --------------------------------------------------------------------------
+# Memory limits
+# --------------------------------------------------------------------------
+
+
+def test_memory_defaults_to_unlimited_with_no_eviction() -> None:
+    config = Config.from_env({})
+
+    assert config.maxmemory == 0
+    assert config.maxmemory_policy == MaxmemoryPolicy.NOEVICTION
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        pytest.param("0", 0, id="unlimited"),
+        pytest.param("1024", 1024, id="bare-bytes"),
+        pytest.param("64kb", 64 * 1024, id="kilobytes"),
+        pytest.param("10mb", 10 * 1024**2, id="megabytes"),
+        pytest.param("1gb", 1024**3, id="gigabytes"),
+        pytest.param("10MB", 10 * 1024**2, id="uppercase"),
+        pytest.param(" 10mb ", 10 * 1024**2, id="surrounding-space"),
+    ],
+)
+def test_memory_sizes_use_binary_units(raw: str, expected: int) -> None:
+    assert Config.from_env({"PYREDIS_MAXMEMORY": raw}).maxmemory == expected
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        pytest.param("1k", id="single-letter-kilo"),
+        pytest.param("1m", id="single-letter-mega"),
+        pytest.param("1g", id="single-letter-giga"),
+        pytest.param("1.5mb", id="fractional"),
+        pytest.param("-1", id="negative"),
+        pytest.param("-1mb", id="negative-with-unit"),
+        pytest.param("", id="empty"),
+        pytest.param("mb", id="unit-without-number"),
+        pytest.param("10 mb", id="internal-space"),
+        pytest.param("10tb", id="unsupported-unit"),
+        pytest.param("lots", id="letters"),
+    ],
+)
+def test_malformed_memory_sizes_are_rejected(raw: str) -> None:
+    with pytest.raises(ConfigError, match="PYREDIS_MAXMEMORY must be a byte count"):
+        Config.from_env({"PYREDIS_MAXMEMORY": raw})
+
+
+@pytest.mark.parametrize("raw", ["noeviction", "allkeys-lru", "ALLKEYS-LRU"])
+def test_the_eviction_policy_is_read_case_insensitively(raw: str) -> None:
+    assert Config.from_env({"PYREDIS_MAXMEMORY_POLICY": raw}).maxmemory_policy == (
+        MaxmemoryPolicy(raw.lower())
+    )
+
+
+@pytest.mark.parametrize("raw", ["allkeys-lfu", "volatile-lru", "random", ""])
+def test_an_unsupported_eviction_policy_is_rejected(raw: str) -> None:
+    with pytest.raises(ConfigError, match="PYREDIS_MAXMEMORY_POLICY must be one of"):
+        Config.from_env({"PYREDIS_MAXMEMORY_POLICY": raw})
+
+
+def test_a_negative_maxmemory_cannot_be_constructed_directly() -> None:
+    with pytest.raises(ConfigError, match="must not be negative"):
+        Config(maxmemory=-1)

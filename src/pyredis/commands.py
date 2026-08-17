@@ -92,6 +92,7 @@ def _set(store: KeyValueStore, args: list[bytes], journal: Journal) -> bytes:
         store.set(args[0], args[1], ttl_ms=ttl_ms)
     except InvalidExpireError:
         return resp.encode_error("ERR invalid expire time in 'set' command")
+    _journal_evictions(store, journal)
     journal.append(encode_set(args[0], args[1], store.deadline_ms(args[0])))
     return resp.OK
 
@@ -161,6 +162,7 @@ def _incr(store: KeyValueStore, args: list[bytes], journal: Journal) -> bytes:
     would find the old value still present and fail on it.
     """
     updated = store.incr(args[0])
+    _journal_evictions(store, journal)
     journal.append(
         encode_set(args[0], str(updated).encode("ascii"), store.deadline_ms(args[0]))
     )
@@ -227,7 +229,17 @@ def dispatch(
         # mutation is refused above.
         return resp.encode_error(_PERSISTENCE_ERROR)
     except StoreError as exc:
-        return resp.encode_error(f"ERR {exc}")
+        return resp.encode_error(f"{exc.prefix} {exc}")
+
+
+def _journal_evictions(store: KeyValueStore, journal: Journal) -> None:
+    """Record the keys a write had to evict, before recording the write itself.
+
+    Without this their original SET records would still be in the log, and a
+    restart would bring back exactly the keys memory pressure removed.
+    """
+    for key in store.take_evicted():
+        journal.append(encode_delete([key]))
 
 
 def _unknown_command(name: bytes, args: list[bytes]) -> str:

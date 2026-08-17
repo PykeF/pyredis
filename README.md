@@ -3,11 +3,11 @@
 An in-memory key-value store written from scratch in Python, built to speak the
 Redis wire protocol.
 
-> **Status: Phase 4 (AOF persistence).** PyRedis speaks RESP2 over raw TCP with
-> key expiration and optional durability, so real Redis clients such as
-> `redis-cli -p 6380` can drive it — but only for the eleven commands listed
-> below. This is **not** general Redis compatibility: there is no RESP3, no
-> eviction, no AOF rewrite, and the vast majority of Redis commands are simply
+> **Status: complete (P0–P5).** PyRedis speaks RESP2 over raw TCP, with key
+> expiration, optional durability, and bounded memory with LRU eviction — so
+> real Redis clients such as `redis-cli -p 6380` can drive it, for the eleven
+> commands listed below. This is **not** general Redis compatibility: there is
+> no RESP3, no AOF rewrite, and the vast majority of Redis commands are simply
 > unknown.
 
 ## Why this exists
@@ -31,7 +31,7 @@ narrow: no clustering, replication, Sentinel, Pub/Sub, Streams, Lua, or ACLs.
                 |
         AOF append + replay           aof.py         done
                 |
-        memory accounting + eviction                 P5
+        memory accounting + eviction  store.py       done
 ```
 
 Design constraints carried through every phase:
@@ -49,7 +49,7 @@ Design constraints carried through every phase:
 | P2    | RESP2 protocol + async TCP server        | **Implemented** |
 | P3    | TTL / expiration                         | **Implemented** |
 | P4    | AOF persistence and recovery             | **Implemented** |
-| P5    | Memory limits and eviction               | Planned        |
+| P5    | Memory limits and eviction               | **Implemented** |
 
 ## What is actually implemented
 
@@ -260,6 +260,69 @@ an `INCR`-heavy workload makes for a slow reload; RDB snapshots; a format
 version header; per-record checksums; and streaming replay (the file is read
 into memory at startup).
 
+**P5 — memory limits and eviction**
+
+Unlimited by default. Set `PYREDIS_MAXMEMORY` to bound the keyspace, and
+`PYREDIS_MAXMEMORY_POLICY` to decide what happens at the ceiling.
+
+`memory_used` is a **deterministic accounting model, not process RSS**:
+
+```
+memory_used = Σ over live keys ( len(key) + len(value) + 64 )
+```
+
+The 64 bytes stand in for two dictionary slots and the object headers. Nothing
+here measures the allocator — deliberately, since the model has to be exactly
+predictable to be worth testing against. **Expiration metadata is outside the
+model**, so a key with a TTL costs exactly what the same key without one costs;
+`EXPIRE` therefore never fails for want of memory, and `PERSIST` never frees
+any. The total is maintained incrementally, so checking it is never a scan.
+
+The limit is **hard**: after every admitted write, `memory_used <= maxmemory`.
+Redis's limit is soft — it evicts before a command and lets that command
+overshoot — but a hard ceiling is a stronger property and the divergence costs
+nothing when allocator compatibility was never claimed.
+
+| Policy | A write that would exceed the limit |
+| ------ | ----------------------------------- |
+| `noeviction` *(default)* | Refused with `-OOM command not allowed when used memory > 'maxmemory'.`, changing nothing |
+| `allkeys-lru` | Reclaims expired keys, then evicts least-recently-used keys until it fits |
+
+Only `SET` and `INCR` can be refused. `DEL`, `PERSIST`, `FLUSHDB`, and any
+overwrite that *shrinks* a value are always admitted, and reads never fail.
+
+**Recency** is a logical counter rather than a clock, so ordering is exact and
+eviction is fully deterministic. `GET`, `SET`, and `INCR` count as use;
+`EXISTS`, `TTL`, `DBSIZE`, `EXPIRE`, and `PERSIST` do not — the first three are
+introspection (Redis marks them `NOTOUCH` for the same reason) and the last two
+are metadata administration, so a TTL-management pass cannot skew eviction.
+
+**Choosing a victim** samples 5 keys from a round-robin cursor and evicts the
+least recently used of them, which keeps eviction bounded instead of scanning
+the keyspace. Expired keys are reclaimed first, so garbage is never kept in
+preference to live data, and the key being written is never its own victim.
+
+**Nothing is ever half-evicted.** A write either fits after eviction or is
+refused before a single key is removed: the only way eviction can fail is that
+the entry would not fit in an empty keyspace, and that is checked up front.
+
+**Evictions are journalled** as canonical `DEL` records, written before the
+write that caused them. Without that, the victim's original `SET` record would
+still be in the log and a restart would undo the eviction. If the journal has
+failed, the P4 rules apply unchanged — the triggering command reports
+`-ERR persistence failure`, later mutations are refused, reads carry on, and
+the evicted keys can reappear after a restart because their removal was never
+recorded.
+
+Recovery ignores the limit: a log written under one ceiling must load under
+another, so replay loads everything, logs a warning if the result is over the
+limit, and the first admitted write brings the keyspace back within it.
+
+**Not implemented:** LFU, any `volatile-*` policy, random eviction,
+`maxmemory-samples` tuning, and runtime `CONFIG SET`. Note that `maxmemory`
+bounds **memory, not disk** — without AOF rewrite the log keeps growing however
+much is evicted.
+
 ### Compatibility boundaries
 
 PyRedis targets real RESP2 clients **for the eight commands above, and nothing
@@ -280,9 +343,8 @@ more**. Concretely:
   1,048,576 elements per request and 64 MiB per bulk string. Configurable
   resource limits belong to P5.
 
-**Not implemented yet:** memory limits and eviction (P5), RESP3, replication,
-clustering, Pub/Sub, transactions, authentication, Lua, and every Redis type
-other than scalar byte values.
+**Not implemented:** RESP3, replication, clustering, Pub/Sub, transactions,
+authentication, Lua, and every Redis type other than scalar byte values.
 
 ## Configuration
 
@@ -294,6 +356,13 @@ other than scalar byte values.
 | `PYREDIS_AOF_ENABLED` | `false`   | Append every mutation to a log and replay it at startup |
 | `PYREDIS_AOF_PATH`  | `pyredis.aof` | Where that log lives                       |
 | `PYREDIS_AOF_FSYNC` | `everysec`  | `always` / `everysec` / `no`                   |
+| `PYREDIS_MAXMEMORY` | `0`         | Keyspace limit; `0` is unlimited               |
+| `PYREDIS_MAXMEMORY_POLICY` | `noeviction` | `noeviction` / `allkeys-lru`          |
+
+Sizes are **binary and only binary**: a bare number is bytes, and `kb`/`mb`/`gb`
+mean 1024, 1024², and 1024³ (`64kb`, `10mb`, `1gb`). The single-letter forms
+`1k`/`1m`/`1g` are **rejected** rather than guessed at, because Redis reads `1k`
+as 1000 and `1kb` as 1024 and quietly disagreeing would be worse than refusing.
 
 Port `0` is accepted and asks the OS for a free port, which the startup log then
 reports. (That is not Redis' meaning for port 0, which is "do not listen".)

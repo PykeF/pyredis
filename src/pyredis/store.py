@@ -20,6 +20,7 @@ from __future__ import annotations
 import re
 import time
 from collections.abc import Callable
+from enum import StrEnum
 from typing import Final, NamedTuple
 
 #: Values are constrained to the signed 64-bit range Redis inherits from C.
@@ -33,6 +34,26 @@ INT64_MAX: Final = 2**63 - 1
 #: and anything non-ASCII.
 _INTEGER_RE: Final = re.compile(rb"0|-?[1-9][0-9]*")
 
+#: What one key is modelled to cost beyond its bytes: two dictionary slots and
+#: the headers of the key and value objects. A fixed, deliberately round
+#: number -- `memory_used` is an accounting model of the keyspace, not a
+#: measurement of the process.
+ENTRY_OVERHEAD_BYTES: Final = 64
+
+#: How many keys an eviction looks at before choosing the least recently used
+#: of them. Sampling keeps eviction O(1)-ish; looking at everything would not.
+MAXMEMORY_SAMPLES: Final = 5
+
+
+class MaxmemoryPolicy(StrEnum):
+    """What to do when a write would take the keyspace over `maxmemory`."""
+
+    NOEVICTION = "noeviction"
+    ALLKEYS_LRU = "allkeys-lru"
+
+
+MAXMEMORY_POLICIES: Final = tuple(policy.value for policy in MaxmemoryPolicy)
+
 
 def now_ms() -> int:
     """The production clock: Unix time in whole milliseconds."""
@@ -40,7 +61,14 @@ def now_ms() -> int:
 
 
 class StoreError(Exception):
-    """Base class for errors the store reports back to a client."""
+    """Base class for errors the store reports back to a client.
+
+    `prefix` is the RESP error code the reply carries. Nearly everything is a
+    plain `ERR`; running out of memory is the one thing Redis clients expect to
+    recognise by its own code.
+    """
+
+    prefix = "ERR"
 
 
 class NotAnIntegerError(StoreError):
@@ -68,6 +96,15 @@ class InvalidExpireError(StoreError):
         super().__init__("invalid expire time")
 
 
+class OutOfMemoryError(StoreError):
+    """The write cannot be admitted without exceeding `maxmemory`."""
+
+    prefix = "OOM"
+
+    def __init__(self) -> None:
+        super().__init__("command not allowed when used memory > 'maxmemory'.")
+
+
 class TtlResult(NamedTuple):
     """The outcome of a TTL query, evaluated against a single clock reading.
 
@@ -83,9 +120,27 @@ class TtlResult(NamedTuple):
 class KeyValueStore:
     """A single PyRedis database: a flat mapping of byte keys to byte values."""
 
-    __slots__ = ("_clock", "_data", "_expires", "_sweep_cursor")
+    __slots__ = (
+        "_access",
+        "_clock",
+        "_data",
+        "_evict_cursor",
+        "_evicted",
+        "_expires",
+        "_maxmemory",
+        "_memory",
+        "_policy",
+        "_sweep_cursor",
+        "_tick",
+    )
 
-    def __init__(self, clock: Callable[[], int] = now_ms) -> None:
+    def __init__(
+        self,
+        clock: Callable[[], int] = now_ms,
+        *,
+        maxmemory: int = 0,
+        policy: MaxmemoryPolicy = MaxmemoryPolicy.NOEVICTION,
+    ) -> None:
         self._data: dict[bytes, bytes] = {}
         #: key -> absolute deadline in ms. Never holds a key absent from _data.
         self._expires: dict[bytes, int] = {}
@@ -95,33 +150,57 @@ class KeyValueStore:
         #: time it runs.
         self._sweep_cursor: list[bytes] = []
 
+        #: 0 means unlimited.
+        self._maxmemory = maxmemory
+        self._policy = policy
+        #: Maintained incrementally, so checking it never costs a scan.
+        self._memory = 0
+        #: key -> logical access counter. A counter rather than a timestamp:
+        #: it orders accesses exactly, with no ties inside a clock tick and no
+        #: dependence on the wall clock.
+        self._access: dict[bytes, int] = {}
+        self._tick = 0
+        #: Round-robin cursor over the keyspace, for sampling eviction
+        #: candidates without materialising every key each time.
+        self._evict_cursor: list[bytes] = []
+        #: Keys evicted by the most recent call, waiting to be reported.
+        self._evicted: list[bytes] = []
+
     def set(self, key: bytes, value: bytes, *, ttl_ms: int | None = None) -> None:
         """Store `value` under `key`, replacing any existing value.
 
         A plain `set` clears any deadline the key had. Passing `ttl_ms`
-        installs a new one, replacing whatever was there.
+        installs a new one, replacing whatever was there. A deadline costs
+        nothing under the memory model, so a timed write is admitted on
+        exactly the same terms as an untimed one.
 
         Raises:
             InvalidExpireError: `ttl_ms` is not positive, or the resulting
                 deadline leaves the signed 64-bit range.
+            OutOfMemoryError: the write cannot be admitted within `maxmemory`.
         """
-        if ttl_ms is None:
-            self._data[key] = value
+        deadline = None if ttl_ms is None else self._deadline(ttl_ms)
+        self._admit(key, value)
+        self._write(key, value)
+        if deadline is None:
             self._expires.pop(key, None)
-            return
-
-        deadline = self._deadline(ttl_ms)
-        self._data[key] = value
-        self._expires[key] = deadline
+        else:
+            self._expires[key] = deadline
+        self._touch(key)
 
     def get(self, key: bytes) -> bytes | None:
         """Return the value stored under `key`, or `None` if it is not set.
 
         `None` is distinct from `b""`: a key explicitly set to the empty value
         exists and returns `b""`. An expired key reads as missing.
+
+        A hit counts as use, so it makes the key a later eviction candidate.
         """
         self._drop_if_expired(key)
-        return self._data.get(key)
+        value = self._data.get(key)
+        if value is not None:
+            self._touch(key)
+        return value
 
     def delete(self, *keys: bytes) -> int:
         """Remove `keys`, returning how many of them were actually present.
@@ -162,8 +241,10 @@ class KeyValueStore:
             NotAnIntegerError: the stored value is not a canonical decimal
                 integer within the signed 64-bit range.
             IntegerOverflowError: the result would leave that range.
+            OutOfMemoryError: the longer value cannot be admitted within
+                `maxmemory`.
 
-        The stored value and its deadline are left untouched when either error
+        The stored value and its deadline are left untouched when any of these
         is raised.
         """
         self._drop_if_expired(key)
@@ -172,7 +253,10 @@ class KeyValueStore:
         updated = current + 1
         if updated > INT64_MAX:
             raise IntegerOverflowError
-        self._data[key] = str(updated).encode("ascii")
+        encoded = str(updated).encode("ascii")
+        self._admit(key, encoded)
+        self._write(key, encoded)
+        self._touch(key)
         return updated
 
     def expire(self, key: bytes, ttl_ms: int) -> bool:
@@ -249,6 +333,28 @@ class KeyValueStore:
         self._data.clear()
         self._expires.clear()
         self._sweep_cursor.clear()
+        self._access.clear()
+        self._evict_cursor.clear()
+        self._memory = 0
+
+    @property
+    def memory_used(self) -> int:
+        """Bytes the keyspace is modelled to occupy.
+
+        A deterministic accounting model -- key bytes, value bytes, and a fixed
+        per-key constant -- and deliberately not a measurement of the process.
+        Deadlines are stored but not counted.
+        """
+        return self._memory
+
+    def take_evicted(self) -> list[bytes]:
+        """Return the keys evicted by the last call, and forget them.
+
+        The caller records them; the store never touches the filesystem.
+        """
+        evicted = self._evicted
+        self._evicted = []
+        return evicted
 
     def sweep_expired(self, limit: int) -> int:
         """Examine at most `limit` keys with deadlines; drop the expired ones.
@@ -285,8 +391,14 @@ class KeyValueStore:
     # say about. One `drop_expired` pass after the replay settles that.
 
     def restore(self, key: bytes, value: bytes, *, deadline_ms: int | None = None) -> None:
-        """Put `key` back exactly as recorded, deadline included."""
-        self._data[key] = value
+        """Put `key` back exactly as recorded, deadline included.
+
+        Recovery ignores `maxmemory`: a log that was written under one limit
+        must load under another, and the first admitted write afterwards brings
+        the keyspace back within bounds. It also does not count as use --
+        replay must not invent a recency order that nobody actually created.
+        """
+        self._write(key, value)
         if deadline_ms is None:
             self._expires.pop(key, None)
         else:
@@ -304,8 +416,8 @@ class KeyValueStore:
     def discard(self, *keys: bytes) -> None:
         """Remove `keys` unconditionally, reporting nothing."""
         for key in keys:
-            self._data.pop(key, None)
-            self._expires.pop(key, None)
+            if key in self._data:
+                self._remove(key)
 
     def _deadline(self, ttl_ms: int) -> int:
         if ttl_ms <= 0:
@@ -328,8 +440,97 @@ class KeyValueStore:
             self._remove(key)
 
     def _remove(self, key: bytes) -> None:
-        del self._data[key]
+        self._memory -= _cost(key, self._data.pop(key))
         self._expires.pop(key, None)
+        self._access.pop(key, None)
+
+    def _write(self, key: bytes, value: bytes) -> None:
+        """Store a value, keeping the memory total exact."""
+        previous = self._data.get(key)
+        if previous is None:
+            self._memory += _cost(key, value)
+        else:
+            self._memory += len(value) - len(previous)
+        self._data[key] = value
+
+    def _touch(self, key: bytes) -> None:
+        """Mark `key` as just used, for eviction ordering."""
+        self._tick += 1
+        self._access[key] = self._tick
+
+    # -- Memory limits ------------------------------------------------------
+
+    def _admit(self, key: bytes, value: bytes) -> None:
+        """Make room for `key` holding `value`, or refuse the write.
+
+        Either this returns having freed enough, or it raises having changed
+        nothing at all -- there is no half-evicted outcome. That holds because
+        the one way eviction can fail is that the entry would not fit even in
+        an empty keyspace, which is checked before a single key is removed.
+
+        Raises:
+            OutOfMemoryError: the write cannot be admitted.
+        """
+        if self._maxmemory == 0:
+            return
+
+        cost = _cost(key, value)
+        if self._projected(key, cost) <= self._maxmemory:
+            return
+        if self._policy is MaxmemoryPolicy.NOEVICTION:
+            raise OutOfMemoryError
+        if cost > self._maxmemory:
+            # Even an empty keyspace could not hold it; refuse before evicting.
+            raise OutOfMemoryError
+
+        # Reclaim what has merely expired before destroying anything live.
+        self.drop_expired()
+        while self._projected(key, cost) > self._maxmemory:
+            victim = self._select_victim(key)
+            if victim is None:  # pragma: no cover -- excluded by the check above
+                raise OutOfMemoryError
+            self._remove(victim)
+            self._evicted.append(victim)
+
+    def _projected(self, key: bytes, cost: int) -> int:
+        """What `memory_used` would become if `key` came to cost `cost`."""
+        current = _cost(key, self._data[key]) if key in self._data else 0
+        return self._memory - current + cost
+
+    def _select_victim(self, exclude: bytes) -> bytes | None:
+        """The least recently used of a small sample, never `exclude`.
+
+        Candidates come from a round-robin cursor rather than a random sample:
+        drawing randomly would mean rebuilding the whole key list on every
+        eviction, which is the keyspace scan sampling exists to avoid.
+        """
+        candidates: list[bytes] = []
+        refilled = False
+        while len(candidates) < MAXMEMORY_SAMPLES:
+            if not self._evict_cursor:
+                if refilled:
+                    break
+                self._evict_cursor = [key for key in self._data if key != exclude]
+                refilled = True
+                if not self._evict_cursor:
+                    break
+            candidate = self._evict_cursor.pop()
+            if candidate != exclude and candidate in self._data:
+                candidates.append(candidate)
+        if not candidates:
+            return None
+        return min(candidates, key=lambda candidate: self._access.get(candidate, 0))
+
+
+def _cost(key: bytes, value: bytes) -> int:
+    """What one entry is modelled to occupy.
+
+    Deadlines are stored outside this model on purpose: the intent is to
+    approximate the cost of the keyspace payload, not to chase every Python
+    allocation, so a timed write costs exactly what the same untimed write
+    would.
+    """
+    return len(key) + len(value) + ENTRY_OVERHEAD_BYTES
 
 
 def parse_int(value: bytes) -> int:

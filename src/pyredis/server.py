@@ -52,7 +52,9 @@ class Server:
 
     def __init__(self, config: Config) -> None:
         self._config = config
-        self._store = KeyValueStore()
+        self._store = KeyValueStore(
+            maxmemory=config.maxmemory, policy=config.maxmemory_policy
+        )
         self._ready = asyncio.Event()
         self._port: int | None = None
         self._clients: set[asyncio.StreamWriter] = set()
@@ -167,6 +169,15 @@ class Server:
             result.expired,
         )
         self._journal = AppendOnlyFile(path, self._config.aof_fsync)
+        maxmemory = self._config.maxmemory
+        if maxmemory and self._store.memory_used > maxmemory:
+            # Recovery ignores the limit; the first admitted write brings the
+            # keyspace back within it, evicting if the policy allows.
+            _logger.warning(
+                "recovered keyspace uses %d byte(s), over the %d byte limit",
+                self._store.memory_used,
+                maxmemory,
+            )
 
     async def _fsync_cycle(self) -> None:
         """Commit the journal to disk once a second under the everysec policy."""

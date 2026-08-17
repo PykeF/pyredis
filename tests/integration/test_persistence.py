@@ -15,6 +15,7 @@ from pyredis import server as server_module
 from pyredis.aof import FsyncPolicy, encode_record, encode_set
 from pyredis.config import Config
 from pyredis.server import Server
+from pyredis.store import ENTRY_OVERHEAD_BYTES, MaxmemoryPolicy
 
 TIMEOUT = 5
 
@@ -376,3 +377,173 @@ async def test_an_everysec_fsync_failure_stops_accepting_writes(
         assert await client.command(b"PING") == b"+PONG\r\n"
 
         monkeypatch.setattr(os, "fsync", os.fsync)
+
+
+# --------------------------------------------------------------------------
+# Eviction
+# --------------------------------------------------------------------------
+
+
+ENTRY = 6 + 5 + ENTRY_OVERHEAD_BYTES  # a six-byte key holding a five-byte value
+
+
+@pytest.mark.asyncio
+async def test_noeviction_refuses_a_write_over_the_limit(tmp_path: Path) -> None:
+    config = persistent(tmp_path, maxmemory=ENTRY)
+
+    async with running(config) as connect:
+        client = await connect()
+        assert await client.command(b"SET", b"first_", b"value") == b"+OK\r\n"
+
+        assert await client.command(b"SET", b"second", b"value") == (
+            b"-OOM command not allowed when used memory > 'maxmemory'.\r\n"
+        )
+        # Nothing changed, and the connection is still perfectly usable.
+        assert await client.command(b"DBSIZE") == b":1\r\n"
+        assert await client.command(b"GET", b"first_") == b"$5\r\nvalue\r\n"
+        assert await client.command(b"PING") == b"+PONG\r\n"
+
+
+@pytest.mark.asyncio
+async def test_allkeys_lru_evicts_instead_of_refusing(tmp_path: Path) -> None:
+    config = persistent(
+        tmp_path, maxmemory=2 * ENTRY, maxmemory_policy=MaxmemoryPolicy.ALLKEYS_LRU
+    )
+
+    async with running(config) as connect:
+        client = await connect()
+        await client.command(b"SET", b"first_", b"value")
+        await client.command(b"SET", b"second", b"value")
+
+        assert await client.command(b"SET", b"third_", b"value") == b"+OK\r\n"
+        assert await client.command(b"DBSIZE") == b":2\r\n"
+        assert await client.command(b"GET", b"first_") == b"$-1\r\n"
+        assert await client.command(b"GET", b"third_") == b"$5\r\nvalue\r\n"
+
+
+@pytest.mark.asyncio
+async def test_reading_a_key_changes_the_eviction_victim(tmp_path: Path) -> None:
+    config = persistent(
+        tmp_path, maxmemory=2 * ENTRY, maxmemory_policy=MaxmemoryPolicy.ALLKEYS_LRU
+    )
+
+    async with running(config) as connect:
+        client = await connect()
+        await client.command(b"SET", b"first_", b"value")
+        await client.command(b"SET", b"second", b"value")
+
+        await client.command(b"GET", b"first_")  # promotes first_
+        await client.command(b"SET", b"third_", b"value")
+
+        assert await client.command(b"GET", b"first_") == b"$5\r\nvalue\r\n"
+        assert await client.command(b"GET", b"second") == b"$-1\r\n"
+
+
+@pytest.mark.asyncio
+async def test_one_write_can_evict_several_keys_over_the_wire(tmp_path: Path) -> None:
+    config = persistent(
+        tmp_path, maxmemory=6 * ENTRY, maxmemory_policy=MaxmemoryPolicy.ALLKEYS_LRU
+    )
+
+    async with running(config) as connect:
+        client = await connect()
+        for index in range(6):
+            await client.command(b"SET", b"key%03d" % index, b"value")
+
+        assert await client.command(b"SET", b"big___", b"v" * (4 * ENTRY)) == b"+OK\r\n"
+
+        remaining = int((await client.command(b"DBSIZE"))[1:-2])
+        assert remaining < 6
+        assert await client.command(b"GET", b"big___") != b"$-1\r\n"
+
+
+@pytest.mark.asyncio
+async def test_expired_keys_are_reclaimed_before_live_keys_are_evicted(
+    tmp_path: Path,
+) -> None:
+    config = persistent(
+        tmp_path, maxmemory=3 * ENTRY, maxmemory_policy=MaxmemoryPolicy.ALLKEYS_LRU
+    )
+
+    async with running(config) as connect:
+        client = await connect()
+        await client.command(b"SET", b"doomed", b"value", b"PX", b"50")
+        await client.command(b"SET", b"live-1", b"value")
+        await client.command(b"SET", b"live-2", b"value")
+
+        await asyncio.sleep(0.1)  # doomed becomes garbage
+
+        await client.command(b"SET", b"fresh_", b"value")
+
+        # The expired key paid for the new one; both live keys survived.
+        assert await client.command(b"GET", b"live-1") == b"$5\r\nvalue\r\n"
+        assert await client.command(b"GET", b"live-2") == b"$5\r\nvalue\r\n"
+        assert await client.command(b"GET", b"fresh_") == b"$5\r\nvalue\r\n"
+
+
+@pytest.mark.asyncio
+async def test_an_evicted_key_does_not_come_back_after_a_restart(
+    tmp_path: Path,
+) -> None:
+    # Without a DEL record the victim's original SET would still be in the log,
+    # and recovery would undo the eviction.
+    config = persistent(
+        tmp_path, maxmemory=2 * ENTRY, maxmemory_policy=MaxmemoryPolicy.ALLKEYS_LRU
+    )
+
+    async with running(config) as connect:
+        client = await connect()
+        await client.command(b"SET", b"first_", b"value")
+        await client.command(b"SET", b"second", b"value")
+        await client.command(b"SET", b"third_", b"value")
+        assert await client.command(b"GET", b"first_") == b"$-1\r\n"
+
+    async with running(config) as connect:
+        client = await connect()
+        assert await client.command(b"GET", b"first_") == b"$-1\r\n"
+        assert await client.command(b"GET", b"second") == b"$5\r\nvalue\r\n"
+        assert await client.command(b"GET", b"third_") == b"$5\r\nvalue\r\n"
+        assert await client.command(b"DBSIZE") == b":2\r\n"
+
+
+@pytest.mark.asyncio
+async def test_a_persistence_failure_during_eviction_blocks_further_writes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = persistent(
+        tmp_path, maxmemory=2 * ENTRY, maxmemory_policy=MaxmemoryPolicy.ALLKEYS_LRU
+    )
+
+    async with running(config) as connect:
+        client = await connect()
+        await client.command(b"SET", b"first_", b"value")
+        await client.command(b"SET", b"second", b"value")
+
+        def broken_fsync(fd: int) -> None:
+            raise OSError(28, "No space left on device")
+
+        monkeypatch.setattr(os, "fsync", broken_fsync)
+
+        # This write must evict, and the eviction's DEL is what fails.
+        assert await client.command(b"SET", b"third_", b"value") == (
+            b"-ERR persistence failure\r\n"
+        )
+        assert await client.command(b"SET", b"fourth", b"value") == (
+            b"-ERR persistence failure\r\n"
+        )
+        assert await client.command(b"GET", b"second") == b"$5\r\nvalue\r\n"
+        assert await client.command(b"PING") == b"+PONG\r\n"
+
+        monkeypatch.setattr(os, "fsync", os.fsync)
+
+
+@pytest.mark.asyncio
+async def test_unlimited_memory_never_evicts(tmp_path: Path) -> None:
+    config = persistent(tmp_path)  # maxmemory defaults to 0
+
+    async with running(config) as connect:
+        client = await connect()
+        for index in range(200):
+            assert await client.command(b"SET", b"key%03d" % index, b"value") == b"+OK\r\n"
+
+        assert await client.command(b"DBSIZE") == b":200\r\n"
