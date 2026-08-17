@@ -3,9 +3,10 @@
 An in-memory key-value store written from scratch in Python, built to speak the
 Redis wire protocol.
 
-> **Status: Phase 0 (foundation).** PyRedis does not store keys, speak RESP, or
-> accept TCP connections yet. It is **not** Redis-compatible today — that claim
-> belongs to P2, once RESP2 and real commands exist.
+> **Status: Phase 1 (core in-memory store).** The keyspace works as a Python
+> library, but PyRedis does not speak RESP or accept TCP connections yet, so no
+> Redis client can talk to it. It is **not** Redis-compatible today — that claim
+> belongs to P2, once RESP2 and a command layer exist.
 
 ## Why this exists
 
@@ -42,13 +43,15 @@ Design constraints carried through every phase:
 | Phase | Scope                                   | Status         |
 | ----- | --------------------------------------- | -------------- |
 | P0    | Foundation: config, logging, entry point | **Implemented** |
-| P1    | Core in-memory key-value store           | Planned        |
+| P1    | Core in-memory key-value store           | **Implemented** |
 | P2    | RESP2 protocol + async TCP server        | Planned        |
 | P3    | TTL / expiration                         | Planned        |
 | P4    | AOF persistence and recovery             | Planned        |
 | P5    | Memory limits and eviction               | Planned        |
 
-## What P0 actually implements
+## What is actually implemented
+
+**P0 — foundation**
 
 - `pyredis.config` — an immutable, validated `Config` (host, port, log level)
   loaded from `PYREDIS_`-prefixed environment variables, with defaults.
@@ -57,6 +60,40 @@ Design constraints carried through every phase:
 - `pyredis.server` — the process lifecycle: load config, configure logging,
   enter the asyncio run loop, exit cleanly. `Server.serve()` is already a
   coroutine so P2 can drop a listener into it without reshaping startup.
+
+**P1 — core in-memory store**
+
+`pyredis.store.KeyValueStore` is a synchronous, in-process keyspace holding
+scalar values. It depends on nothing else in PyRedis and nothing in `asyncio`.
+
+| Operation | Method | Returns |
+| --------- | ------ | ------- |
+| SET     | `set(key, value)`  | `None` — unconditional overwrite |
+| GET     | `get(key)`         | the value, or `None` if the key is not set |
+| DEL     | `delete(*keys)`    | how many of the given keys existed |
+| EXISTS  | `exists(*keys)`    | how many are set, counting repeated keys each time |
+| INCR    | `incr(key)`        | the new value; a missing key starts from 0 |
+| DBSIZE  | `dbsize()`         | number of keys |
+| FLUSHDB | `flushdb()`        | `None` — removes every key |
+
+Keys and values are **binary-safe `bytes`** internally: any byte sequence —
+including NUL bytes and data that is not valid UTF-8 — is stored and returned
+unchanged, and keys collide only on exact byte equality. Nothing decodes to
+`str`, so no encoding is ever assumed.
+
+`INCR` follows Redis' integer rules: values must be canonical decimal within
+the signed 64-bit range, so `+1`, `01`, `-0`, and surrounding whitespace are
+rejected with `NotAnIntegerError`, and exceeding the range raises
+`IntegerOverflowError`. A failed `INCR` leaves the stored value untouched.
+
+The store is deliberately **not** thread-safe and takes no locks; from P2 it is
+owned by a single event-loop thread, which is what makes each operation atomic.
+
+**Not implemented yet:** RESP2 parsing/serialization, TCP networking, a command
+dispatcher, TTL/expiration, AOF persistence, and eviction. There is no way to
+reach the store over a socket — it is importable Python only. Multiple
+databases, `SELECT`, `SET` options such as `NX`/`EX`, and every non-scalar
+Redis type are also out of scope so far.
 
 ## Configuration
 
@@ -85,8 +122,18 @@ Run the application:
 uv run pyredis
 ```
 
-In P0 this prints its resolved configuration and exits `0` — it does **not**
-open a socket.
+This logs its resolved configuration and exits `0`. It does **not** open a
+socket, and it does not yet start a keyspace — until P2 wires the two together,
+the store is reachable only from Python:
+
+```python
+from pyredis.store import KeyValueStore
+
+store = KeyValueStore()
+store.set(b"greeting", b"hello")
+store.get(b"greeting")   # b"hello"
+store.incr(b"visits")    # 1
+```
 
 ## Development
 
